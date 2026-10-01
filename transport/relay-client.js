@@ -458,6 +458,11 @@ export class RelayConnector {
         code: result.code,
         setCookie: result.setCookie
       });
+      // ★ 配对成功立即上报设备表：新设备（配对页每次生成新公钥 → 新 deviceId）在
+      //   下次重连前必然不在中继路由表里，welcome 之后的 / 只能靠中继兜底抽奖路由
+      //   （真机事故 2026-10-01：多连接器时被投进错误/僵尸连接器，手机卡死在
+      //   「配对完成，正在进入 DSH…」）。
+      this.publishDevices();
     } catch (error) {
       this.send({ kind: 'pair-result', channel: frame.channel, ok: false, error: error.message });
     }

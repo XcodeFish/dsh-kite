@@ -39,7 +39,7 @@ import { menuEntryRows } from './admin/menu-entry.js';
 export const name = 'kite';
 export const inject = ['webServer'];
 
-const VERSION = '0.2.0';
+const VERSION = '0.2.1';
 
 /** 数据目录：$DSH_HOME/plugin-data/dsh-kite/<profile>/（宿主进程没有 DSH_PROFILE → default）。 */
 export function defaultDataDir(config) {

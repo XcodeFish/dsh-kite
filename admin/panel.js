@@ -436,7 +436,8 @@ function renderPairHtml() {
   <p>桌面端面板（「远程访问」）应显示同样的 6 位数字。不一致请不要继续。</p>
   <button id="confirm">确认并进入 DSH</button>
 </div>
-<div id="step-done" class="hidden"><p>配对完成，正在进入 DSH…</p></div>
+<div id="step-done" class="hidden"><p>配对完成，正在进入 DSH…</p>
+<p id="stuck" class="hidden" style="color:#f85149;line-height:1.7">超过 20 秒仍未进入：中继没能把请求送到桌面端（常见于同一中继挂着多个 DSH 实例，或连接器掉线未被清理）。请回桌面端「远程访问」面板确认连接器在线后，<a id="retry-enter" style="color:#58a6ff;cursor:pointer;text-decoration:underline">点此重试</a>。</p></div>
 <script>
 (async () => {
   const $ = (id) => document.getElementById(id);
@@ -472,6 +473,11 @@ function renderPairHtml() {
       var q = connectorId ? ('?c=' + encodeURIComponent(connectorId)) : '';
       location.href = 'about:blank';  // 立即离开配对页
       location.href = '/kite/welcome' + q;
+      // ★ 跳转看门狗：正常跳转会销毁本页、定时器随之失效；若 20s 后本页仍活着，
+      //   说明 welcome/首页请求在中继侧被黑洞化（多连接器兜底投错/僵尸连接器）。
+      //   与其无限转圈，给出可操作指引。真机事故 2026-10-01。
+      setTimeout(() => { $('stuck').classList.remove('hidden'); }, 20000);
+      $('retry-enter').onclick = () => { location.href = '/kite/welcome' + q; };
     };
   } catch (e) { fail(String(e && e.message || e)); }
 })();

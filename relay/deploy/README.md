@@ -20,8 +20,10 @@ cd ~/.dsh/plugin-src/dsh-kite/relay/deploy
 ./build-bundle.sh
 
 # 2) 上传并安装（服务器上以 root 跑，幂等、失败自动回滚）
+#    ★ PUBLIC_IP 必填：它写进 Caddy 站点片段，并作为 IP 证书的校验目标。
+#      脚本刻意不设默认值 —— 部署环境信息不该硬编码进仓库，缺省时直接报错并给出用法。
 scp dist/ra-relay.tar.gz user@<VPS_IP>:/tmp/
-ssh user@<VPS_IP> 'tar xzf /tmp/ra-relay.tar.gz -C /tmp && sudo /tmp/ra-relay/install.sh'
+ssh user@<VPS_IP> 'tar xzf /tmp/ra-relay.tar.gz -C /tmp && sudo PUBLIC_IP=<VPS_IP> /tmp/ra-relay/install.sh'
 
 # 3) Mac：把插件指向新中继（用第 2 步输出的令牌）
 ./switch-relay.sh --url wss://<VPS_IP>:8443 \
@@ -85,6 +87,7 @@ cd ~/.dsh/plugin-src/dsh-kite/relay/deploy
 
 ## 变更记录
 
+- **2026-10-02** 修文档：第 2 步的安装命令漏了 `PUBLIC_IP`，照抄会直接被脚本挡下（`缺少 PUBLIC_IP 环境变量`）。守卫本身是对的（环境信息不入库），漏的是文档没把变量带上。
 - **2026-10-01** 修 `install.sh` 第 6 步的误判：原实现用 `curl https://<公网IP>:8443` 自检，而云厂商公网 IP 是 NAT 的、不在网卡上，该请求会真的出网卡撞云防火墙 → 超时 → 把一次成功的安装判为失败并回滚（真机事故）。现改为 `--connect-to` 强制回环验证链路，外部可达性降级为提示。
 
 ## 文件清单

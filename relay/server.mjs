@@ -124,6 +124,28 @@ const streams = new Map();
 /** 每 IP 连接速率 */
 const connectRate = new Map();
 
+// ---- 连接器存活探测（keepalive）----
+// ★ 真机事故 2026-10-01：连接器侧 TCP 半开（机器休眠/断网/换网）后 socket 不会立刻
+//   触发 close，僵尸条目永久占住 connectors 表 —— size===2 让「单连接器兜底」失效，
+//   多连接器兜底又把请求投进尸体，请求黑洞化（手机无限转圈到 110s 看门狗）。
+//   中继主动 ping：一个周期内没见到 pong 就 terminate，走 on('close') 的既有清理
+//   （摘设备路由表、给挂起 HTTP 流回 502）。ws/浏览器/undici 客户端在协议层自动回 pong。
+const _pingEnv = Number(process.env.RELAY_CONNECTOR_PING_MS);
+const CONNECTOR_PING_MS = Number.isFinite(_pingEnv) && _pingEnv >= 1000 ? _pingEnv : 30_000;
+const connectorAlive = new WeakMap(); // connector ws → 上个周期是否见到 pong
+setInterval(() => {
+  for (const [id, ws] of connectors) {
+    if (ws.readyState !== 1) continue;
+    if (connectorAlive.get(ws) === false) {
+      console.log(`[ra-relay] 连接器无响应（${CONNECTOR_PING_MS}ms 内未回 pong），剔除 c=${id.slice(0, 12)}`);
+      try { ws.terminate(); } catch { /* close 事件兜底 */ }
+      continue;
+    }
+    connectorAlive.set(ws, false);
+    try { ws.ping(); } catch { /* readyState 竞态，下轮再判 */ }
+  }
+}, CONNECTOR_PING_MS);
+
 function rateLimit(ip) {
   const now = Date.now();
   let entry = connectRate.get(ip);
@@ -184,17 +206,28 @@ function routeHintFromCookie(header) {
   return null;
 }
 
-/** 解析某请求/升级应发往的 connector ws（cookie deviceId → 配对链接 c= → connectorId 直配）。 */
+/**
+ * 解析某请求/升级应发往的 connector ws。候选路由键按可靠性依次尝试：
+ * cookie 的 deviceId → 链接的 c 参数（每个候选先查设备路由表，再按 connectorId 精确匹配）。
+ *
+ * ★ c 参数必须参与精确匹配（真机事故 2026-10-01）：配对完成后手机才第一次带上
+ *   ra-device cookie，而刚配对的设备要等连接器下次上报才进路由表 —— cookie 提示
+ *   必然未命中；此时 welcome 链接里的 c=<connectorId> 是唯一确定性凭据。旧实现
+ *   在 cookie 未命中后直接掉进「多连接器投第一个」的抽奖，把请求送进错误/僵尸
+ *   连接器，手机卡死在「配对完成，正在进入 DSH…」。
+ */
 function connectorFor(req, url) {
-  const hint = routeHintFromCookie(req.headers.cookie) ?? url.searchParams.get('c');
-  if (hint) {
+  const cookieHint = routeHintFromCookie(req.headers.cookie);
+  const cParam = url.searchParams.get('c');
+  for (const hint of [cookieHint, cParam]) {
+    if (!hint) continue;
     const entry = devices.get(hint);
     if (entry) {
       const ws = connectors.get(entry.connectorId);
       if (ws) return { ws, deviceId: hint };
     }
     if (connectors.has(hint)) return { ws: connectors.get(hint), deviceId: 'pair' };
-    // hint 存在但查不到映射 → 继续走兜底（设备表可能刚更新、cookie 可能陈旧）。
+    // hint 存在但查不到映射 → 尝试下一个候选（设备表可能刚更新、cookie 可能陈旧）。
     // ★ 真机事故 2026-09-30：旧实现只认「hint 完全为空」才兜底，导致带陈旧 cookie
     //   的真实请求被拒（界面卡在「重新连接中…」、每次请求都要等超时）。
   }
@@ -203,14 +236,15 @@ function connectorFor(req, url) {
   //   中继不做信任判断 —— 真正的准入仍由连接器验签（ticket）裁决，中继只是转发。
   if (connectors.size === 1) {
     const first = connectors.entries().next().value;
-    return { ws: first[1], deviceId: hint ?? 'pair' };
+    return { ws: first[1], deviceId: cookieHint ?? cParam ?? 'pair' };
   }
 
-  // 多连接器时的配对路径兜底（配对阶段尚无有效凭据）：
+  // 多连接器时的配对路径兜底（配对阶段尚无有效凭据；走到这里说明两个候选键都未命中）：
   if (connectors.size > 1
       && (url.pathname === '/kite/pair' || url.pathname.startsWith('/kite/pair/')
           || url.pathname === '/kite/welcome')) {
     const first = connectors.entries().next().value;
+    console.log(`[ra-relay] 多连接器兜底：${url.pathname} 无确定路由键（cookie=${cookieHint ?? '无'} c=${cParam ?? '无'}），投给第一个连接器`);
     return { ws: first[1], deviceId: 'pair' };
   }
   return null;
@@ -290,6 +324,7 @@ function renderRelayHint({ hasConnector, path }) {
 }
 
 function handlePhoneHttp(req, res) {
+  console.error(`[ra-relay][dbg] +${Date.now() % 100000} req ${req.method} ${req.url}`);
   const url = new URL(req.url ?? '/', 'http://x');
   if (url.pathname === '/healthz') return handleHealth(res);
   if (url.pathname === '/metrics') return handleMetrics(res);
@@ -303,6 +338,7 @@ function handlePhoneHttp(req, res) {
   }
   metrics.httpRequests += 1;
   const routed = connectorFor(req, url);
+  console.error(`[ra-relay][dbg] +${Date.now() % 100000} routed ${req.url} → cid=${routed?.ws ? connectorIdOf(routed.ws) : 'NULL'}`);
   if (!routed?.ws) {
     // 诊断：未路由请求记录关键事实（不含敏感值），便于定位是 c 缺失/错配还是连接器离线。
     const rawCookie = typeof req.headers.cookie === 'string' ? req.headers.cookie : '';
@@ -384,7 +420,9 @@ function handlePhoneHttp(req, res) {
         'accept-encoding': typeof req.headers['accept-encoding'] === 'string' ? req.headers['accept-encoding'] : ''
       }
     };
-    if (!send(connector, head)) {
+    const headSent = send(connector, head);
+    console.error(`[ra-relay][dbg] +${Date.now() % 100000} head sent ${req.url} → ok=${headSent}`);
+    if (!headSent) {
       clearTimeout(timer);
       streams.delete(streamId);
       if (!settled) {
@@ -442,6 +480,8 @@ function onConnector(ws, url) {
   metrics.connectorConnects += 1;
   connectors.get(connectorId)?.close(4000, 'replaced');
   connectors.set(connectorId, ws);
+  connectorAlive.set(ws, true);
+  ws.on('pong', () => connectorAlive.set(ws, true));
   for (const entry of devices.values()) {
     if (entry.connectorId === connectorId) entry.connectorId = connectorId; // 重连后路由已由 key 对齐
   }
