@@ -1,0 +1,504 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DSH Kite · 中继接入配置（交互原型）</title>
+<style>
+:root{color-scheme:dark}
+body{font-family:system-ui,-apple-system,sans-serif;background:#0e1116;color:#e6e8eb;margin:0;padding:2rem 1rem}
+.wrap{max-width:52rem;margin:0 auto}
+h1{font-size:1.4rem}
+h2{font-size:1.05rem;margin-top:2rem;color:#9aa4b2;text-transform:none}
+.card{background:#151a21;border:1px solid #232b36;border-radius:.8rem;padding:1rem 1.2rem;margin:.8rem 0}
+.row{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap}
+button{padding:.5rem .9rem;border:1px solid #2f81f7;border-radius:.5rem;background:transparent;color:#58a6ff;cursor:pointer;font-size:.9rem}
+button.danger{border-color:#f85149;color:#f85149}
+button.primary{background:#2f81f7;color:#fff}
+button:disabled{opacity:.45;cursor:not-allowed}
+button.mini{padding:.35rem .6rem;font-size:.78rem}
+input{background:#0e1116;border:1px solid #2d3744;border-radius:.5rem;color:#e6e8eb;padding:.5rem .7rem;flex:1;min-width:14rem}
+input::placeholder{color:#5a6472}
+table{width:100%;border-collapse:collapse;font-size:.9rem}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.82rem;word-break:break-all}
+.badge{padding:.15rem .55rem;border-radius:99px;font-size:.78rem;white-space:nowrap}
+pre{background:#0b0e12;border-radius:.6rem;padding:.8rem;font-size:.78rem;max-height:18rem;overflow:auto;white-space:pre-wrap;word-break:break-all;margin:0}
+.note{color:#8b949e;font-size:.85rem;line-height:1.6}
+.hidden{display:none!important}
+/* ---- 原型专用 ---- */
+.proto-banner{border:1px dashed #665018;background:#1c1710;color:#e3b341;padding:.7rem 1rem;border-radius:.7rem;font-size:.82rem;line-height:1.7;margin-bottom:1rem}
+.console{border:1px dashed #2d3744;background:#10141a}
+.console code{background:#0b0e12;padding:.05em .4em;border-radius:.3em;color:#9ec3ff;font-family:ui-monospace,Menlo,monospace}
+.field-row{display:flex;gap:.7rem;align-items:baseline;padding:.45rem 0;border-bottom:1px solid #1d242e;flex-wrap:wrap}
+.field-row:last-of-type{border-bottom:0}
+.f-label{flex:0 0 4.2rem;color:#9aa4b2;font-size:.82rem}
+.form-row{display:flex;gap:.5rem;align-items:center;margin-top:.55rem;flex-wrap:wrap}
+.form-row input{flex:1}
+.err{color:#f85149;font-size:.8rem;line-height:1.7;margin:.35rem 0 0 4.7rem}
+.warn-box{background:#3a1518;border:1px solid #f85149;border-radius:.55rem;padding:.7rem .9rem;color:#e6e8eb;font-size:.8rem;line-height:1.75;margin:0 0 .8rem}
+.warn-box b{color:#f85149}
+.info-box{background:#123527;border:1px solid #1f4d38;border-radius:.55rem;padding:.7rem .9rem;color:#c9d1d9;font-size:.8rem;line-height:1.75;margin:0 0 .8rem}
+.hintbox{background:#3a2c12;border:1px solid #665018;color:#e3b341;padding:.55rem .8rem;border-radius:.55rem;font-size:.8rem;line-height:1.7;margin-top:.6rem}
+.envnote{background:#3a2c12;border:1px solid #665018;color:#e3b341;padding:.6rem .8rem;border-radius:.55rem;font-size:.8rem;line-height:1.7;margin-bottom:.4rem}
+.check{display:inline-flex;align-items:center;gap:.4rem;color:#8b949e;font-size:.8rem;margin-top:.55rem;cursor:pointer}
+.check input{min-width:0;flex:0 0 auto;accent-color:#2f81f7}
+.probe-ok{color:#7ee2b8;font-size:.85rem;line-height:1.7}
+.probe-bad{color:#f85149;font-size:.85rem;line-height:1.7}
+.spin{display:inline-block;width:12px;height:12px;border:2px solid #2d3744;border-top-color:#58a6ff;border-radius:50%;animation:sp .8s linear infinite;vertical-align:-2px;margin-right:.4rem}
+@keyframes sp{to{transform:rotate(360deg)}}
+#backdrop{position:fixed;inset:0;z-index:9999;background:rgba(6,8,12,.66);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center}
+.modal{width:min(36rem,92vw);background:#151a21;border:1px solid #232b36;border-radius:.9rem;padding:1rem 1.2rem;box-shadow:0 18px 60px rgba(0,0,0,.55)}
+.m-title{font-weight:600;font-size:.9rem;color:#e6e8eb;margin-bottom:.8rem}
+.d-row{display:flex;gap:.7rem;padding:.45rem 0;border-bottom:1px solid #1d242e;font-size:.8rem;align-items:flex-start}
+.d-k{flex:0 0 4.2rem;color:#9aa4b2}
+.arrow{color:#f85149;font-weight:600;padding:0 .2rem}
+.same{color:#6b7684}
+#toast{position:fixed;left:50%;bottom:1.6rem;transform:translateX(-50%);background:#151a21;border:1px solid #2d3744;color:#e6e8eb;padding:.55rem 1rem;border-radius:.6rem;font-size:.82rem;z-index:10000;box-shadow:0 8px 30px rgba(0,0,0,.5);max-width:90vw}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="proto-banner">
+    <b>交互原型 · 非真实面板</b> —— 本页是「中继接入（可视化配置）」的可点击交互原型，数据全部为内置模拟，不写盘、不真实连接中继。用于评审交互与文案；实现规格见 <span class="mono">docs/交互稿-中继可视化配置.md</span>。
+  </div>
+
+  <div class="card console">
+    <div class="note" style="margin-bottom:.5rem"><b style="color:#9ec3ff">原型演示控制台</b>（仅原型有效）：探针失败可用魔法值触发 —— 地址包含 <code>timeout</code> → 超时、<code>nosuch</code> → DNS 失败、<code>badcert</code> → 证书错误；令牌填 <code>wrong</code> → 401。</div>
+    <div class="row">
+      <button id="sc-reset">重置演示（patch 来源）</button>
+      <button id="sc-env">场景：env 变量生效</button>
+      <button id="sc-killed">场景：kill switch 已启用</button>
+    </div>
+  </div>
+
+  <div class="row" style="justify-content:space-between;align-items:center">
+    <h1 style="margin:0">DSH Kite · 手机远程</h1>
+    <button id="btn-back">← 返回 DSH</button>
+  </div>
+
+  <!-- 中继状态卡（既有内容，作上下文衔接） -->
+  <div class="card">
+    <div class="row"><span id="relay-badge" class="badge" style="background:#123527;color:#7ee2b8">已连接</span><span class="mono" id="relay-url"></span></div>
+    <div class="note" id="relay-note" style="margin-top:.5rem"></div>
+  </div>
+
+  <!-- ===== 新增区块：中继接入（可视化配置） ===== -->
+  <h2>中继接入（可视化配置）</h2>
+
+  <div class="card">
+    <div class="note" style="margin-bottom:.4rem">优先级链：env ＞ relay-override.json（面板）＞ cordis.patch.yml ＞ 默认值 —— 每个字段实际生效的来源见右侧徽标</div>
+    <div class="field-row"><span class="f-label">中继地址</span><span class="mono" id="val-url" style="flex:1"></span><span class="badge" id="src-url"></span></div>
+    <div class="field-row"><span class="f-label">中继令牌</span><span class="mono" id="val-token" style="flex:1"></span><span class="badge" id="src-token"></span></div>
+    <div class="field-row" style="border-bottom:0"><span class="f-label">公网入口</span><span class="mono" id="val-pub" style="flex:1"></span><span class="badge" id="src-pub"></span></div>
+
+    <div class="note" id="ov-note" style="margin-top:.5rem"></div>
+  </div>
+
+  <div class="card">
+    <div id="env-note" class="envnote hidden"><b>env 遮蔽警告</b>：当前 relayUrl / 令牌由环境变量 DSH_KITE_RELAY_URL / DSH_KITE_RELAY_TOKEN 决定，优先级高于面板覆盖 —— 应用的新值会写入 relay-override.json，但实际生效的仍是 env 值。如需让面板配置生效，请移除环境变量并重启 DSH。</div>
+
+    <div class="form-row"><label class="f-label" for="in-url">中继地址</label><input id="in-url" placeholder="wss://relay.example.com:8443" spellcheck="false" autocomplete="off"></div>
+    <div class="err hidden" id="err-url"></div>
+
+    <div class="form-row"><label class="f-label" for="in-token">中继令牌</label><input id="in-token" type="password" placeholder="留空 = 沿用当前令牌" autocomplete="new-password" style="flex:1"><button id="btn-eye" class="mini">显示</button></div>
+    <div class="note" style="margin:.35rem 0 0 4.7rem">留空 = 沿用当前令牌（<span class="mono" id="token-fp-hint"></span>）。已保存的令牌不可查看，应用后只能通过指纹比对。</div>
+
+    <div class="form-row"><label class="f-label" for="in-public">公网入口</label><input id="in-public" placeholder="留空 = 按 wss→https 自动派生" spellcheck="false" autocomplete="off"></div>
+    <div class="err hidden" id="err-public"></div>
+    <div style="margin-left:4.7rem"><label class="check"><input type="checkbox" id="auto-derive" checked> 自动派生公网入口（wss → https，手改即关）</label></div>
+
+    <div class="row" style="margin-top:.9rem">
+      <button id="btn-probe">测试连接</button>
+      <button id="btn-apply" class="primary">应用并重连</button>
+    </div>
+    <div id="btn-notes"></div>
+    <div id="probe-area" class="hidden" aria-live="polite" style="margin-top:.7rem">
+      <div id="probe-main"></div>
+      <div id="probe-sub" class="note" style="margin-top:.25rem"></div>
+    </div>
+  </div>
+  <!-- ===== 新增区块结束 ===== -->
+
+  <h2>添加设备（扫码连接）</h2>
+  <div class="card"><div class="note">（原面板既有区块，原型中省略。位置示意：新增的「中继接入」配置区位于本区之上、中继状态卡之下 —— 换公网入口后，紧接着的动作就是到这里重新扫码。）</div></div>
+
+  <h2>审计（最近事件）</h2>
+  <div class="card"><pre id="audit"></pre></div>
+
+  <div class="note" style="margin-top:2rem">前置条件：DSH NEXT 设置需开启「浏览器访问」（Browser Access），否则中继回环请求会被桌面 browser-access 门 403。本机未开任何入站端口。管理面板仅主机可达；设备侧对 /kite 前缀直接拒绝（404 reserved）。</div>
+</div>
+
+<!-- 两步确认弹层 -->
+<div id="backdrop" class="hidden">
+  <div class="modal" role="dialog" aria-modal="true">
+    <div class="m-title" id="m-title"></div>
+    <div id="m-body"></div>
+    <div class="row" style="justify-content:flex-end;margin-top:1rem">
+      <button id="m-cancel">取消</button>
+      <button id="m-next" class="primary">下一步</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="hidden"></div>
+
+<script>
+'use strict';
+var $ = function (id) { return document.getElementById(id); };
+var esc = function (s) { return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]; }); };
+function fp8(s) { var h = 5381; for (var i = 0; i < s.length; i++) { h = ((h * 33) ^ s.charCodeAt(i)) >>> 0; } return ('00000000' + h.toString(16)).slice(-8); }
+function hhmmss(t) { return new Date(t).toTimeString().slice(0, 8); }
+function derive(u) { return String(u || '').replace(/^wss:/i, 'https:'); }
+
+var demoToken = 'demo-token-2026';
+var S = null;            // 模拟的后端状态
+var pending = null;      // 确认弹层暂存的待应用值
+var probeTimer = null;
+var autoForApply = false;
+var toastTimer = null;
+
+var RELAY_MAP = {
+  open: ['已连接', '#123527', '#7ee2b8'],
+  connecting: ['连接中', '#2a303a', '#9aa4b2'],
+  retrying: ['重试中', '#3a2c12', '#e3b341'],
+  standby: ['待机（未配置中继）', '#2a303a', '#9aa4b2'],
+  killed: ['已紧急停用', '#3a1518', '#f85149']
+};
+var SRC = {
+  env: ['env 优先', '#3a2c12', '#e3b341'],
+  override: ['面板覆盖', '#123527', '#7ee2b8'],
+  patch: ['patch', '#2a303a', '#9aa4b2'],
+  default: ['默认', '#2a303a', '#6b7684'],
+  derived: ['派生', '#2a303a', '#6b7684']
+};
+
+var auditEntries = [
+  { t: Date.now() - 7600 * 1000, line: '{"kind":"killswitch.off"}' },
+  { t: Date.now() - 5100 * 1000, line: '{"kind":"device.paired","deviceId":"dev-8f3a21c9"}' },
+  { t: Date.now() - 600 * 1000, line: '{"kind":"device.revoked","deviceId":"dev-11c9d0b2"}' }
+];
+
+function freshState() {
+  return {
+    effective: { relayUrl: 'wss://198.51.100.10:8443', publicUrl: 'https://198.51.100.10:8443', tokenSet: true, tokenFp: fp8(demoToken) },
+    sources: { relayUrl: 'patch', relayToken: 'patch', publicUrl: 'derived' },
+    override: { exists: false, changedAt: null },
+    killswitch: false,
+    relayOwned: true,
+    relay: { state: 'open', lastError: null },
+    probe: { phase: 'idle', result: null },
+    probeInputs: null,
+    applying: false,
+    repairHint: false
+  };
+}
+
+/* ---------- 校验 ---------- */
+function urlError(v) {
+  if (!v) return null;
+  if (!/^wss:\/\//i.test(v)) return '仅支持 wss://：ws:// 是明文，会把远程入口降级，且牵动安全 Cookie 语义（secureCookies 在启动期捕获，改 scheme 需重建配对/票据服务）。本地联调请直接改 cordis.patch.yml 并重启 DSH。';
+  try { var u = new URL(v); if (!u.hostname) throw new Error('x'); } catch (e) { return 'URL 无法解析：检查是否漏写 wss:// 前缀、有多余空格或非法字符。示例：wss://relay.example.com:8443'; }
+  return null;
+}
+function publicError(v) {
+  if (!v) return null;
+  if (!/^https:\/\//i.test(v)) return '公网入口只允许 https://（由 wss:// 派生而来）。';
+  return null;
+}
+function candPub(url, pubField) { return (pubField || '').trim() || derive(url); }
+
+/* ---------- 渲染 ---------- */
+function renderStatus() {
+  var m = RELAY_MAP[S.relay.state] || ['未知', '#2a303a', '#9aa4b2'];
+  var b = $('relay-badge');
+  b.textContent = m[0]; b.style.background = m[1]; b.style.color = m[2];
+  $('relay-url').textContent = S.effective.relayUrl || '';
+  var parts = [];
+  parts.push(S.effective.publicUrl ? ('手机入口 ' + S.effective.publicUrl) : '未配置手机入口（relayPublicUrl）');
+  parts.push('指纹 e7f6a2b1c93d');
+  if (S.relay.lastError) parts.push('最近错误 ' + S.relay.lastError);
+  if (S.killswitch) parts.push('kill switch 生效中');
+  $('relay-note').textContent = parts.join(' · ');
+}
+
+function setSrc(id, src) {
+  var m = SRC[src] || SRC.default;
+  var el = $(id);
+  el.textContent = m[0]; el.style.background = m[1]; el.style.color = m[2];
+}
+
+function renderCurrent() {
+  $('val-url').textContent = S.effective.relayUrl || '未配置（待机）';
+  var tok = $('val-token');
+  if (S.effective.tokenSet) { tok.textContent = '已设置 · 指纹 sha256:' + S.effective.tokenFp + '…'; tok.style.color = ''; }
+  else { tok.textContent = '未设置'; tok.style.color = '#f85149'; }
+  $('val-pub').textContent = S.effective.publicUrl || ('未配置（按 relayUrl 派生：' + derive(S.effective.relayUrl || '') + '）');
+  setSrc('src-url', S.sources.relayUrl);
+  setSrc('src-token', S.sources.relayToken);
+  setSrc('src-pub', S.sources.publicUrl);
+  $('ov-note').textContent = S.override.exists
+    ? ('覆盖文件 $DSH_HOME/plugin-data/dsh-kite/default/relay-override.json（0600）· 更新于 ' + new Date(S.override.changedAt).toLocaleString() + ' · 删除该文件即回退到下一优先级（无迁移、无版本历史）。')
+    : '当前没有面板覆盖（relay-override.json 不存在；文件损坏同样按无覆盖处理并静默回退）。';
+}
+
+function setErr(id, msg) {
+  var el = $(id);
+  if (msg) { el.textContent = msg; el.classList.remove('hidden'); }
+  else { el.classList.add('hidden'); }
+}
+
+function renderEdit() {
+  var uv = $('in-url').value.trim(), pv = $('in-public').value.trim();
+  setErr('err-url', urlError(uv));
+  setErr('err-public', publicError(pv));
+  $('token-fp-hint').textContent = S.effective.tokenSet ? ('sha256:' + S.effective.tokenFp + '…') : '（当前未设置令牌）';
+  var envOn = S.sources.relayUrl === 'env' || S.sources.relayToken === 'env' || S.sources.publicUrl === 'env';
+  $('env-note').classList.toggle('hidden', !envOn);
+}
+
+function renderButtons() {
+  var url = $('in-url').value.trim();
+  var ue = urlError(url);
+  var probePending = S.probe.phase === 'pending';
+  $('btn-probe').disabled = S.applying || probePending || !url || !!ue;
+  $('btn-apply').disabled = S.applying || probePending || S.killswitch || !S.relayOwned || !url || !!ue;
+  $('btn-apply').textContent = S.applying ? '写入并重连中…' : '应用并重连';
+  $('btn-apply').title = (!url || ue) ? '先填写合法的 wss:// 中继地址' : '';
+  var notes = '';
+  if (S.killswitch) {
+    notes += '<div class="err" style="margin:.6rem 0 0">kill switch 生效中：连接器已断开并停止重连。请先在「已配对设备」区点击「紧急停用」解除后再应用新配置。</div>';
+  } else if (!S.relayOwned) {
+    notes += '<div class="err" style="margin:.6rem 0 0">中继由另一 DSH 实例接管：请在该实例的面板操作。</div>';
+  }
+  if (S.repairHint && !S.killswitch) {
+    notes += '<div class="hintbox">已换公网入口：请到「添加设备」重新生成二维码，逐台重新扫码；重新扫码前手机无法连接。</div>';
+  }
+  $('btn-notes').innerHTML = notes;
+}
+
+function renderProbe() {
+  var area = $('probe-area'), main = $('probe-main'), sub = $('probe-sub');
+  var p = S.probe;
+  if (p.phase === 'idle') { area.classList.add('hidden'); return; }
+  area.classList.remove('hidden');
+  if (p.phase === 'pending') {
+    main.className = 'note';
+    main.innerHTML = '<span class="spin"></span>探针中…（使用临时 connectorId <span class="mono">probe-7f3a</span>，不影响在线连接）';
+    sub.textContent = autoForApply ? '输入与上次探针不一致：应用前自动重新探针，通过后打开确认弹层。' : '上限 10 秒；超时、401、格式错、DNS 失败等会分别给出可读原因。';
+    return;
+  }
+  var r = p.result;
+  if (r.code === 'ok') {
+    main.className = 'probe-ok';
+    main.textContent = '✓ 探针通过 · ' + r.latencyMs + 'ms · 中继握手与令牌校验均正常';
+    sub.textContent = '';
+  } else {
+    main.className = 'probe-bad';
+    main.textContent = '✗ ' + r.reason;
+    sub.textContent = '下一步：' + r.next;
+  }
+}
+
+function renderAudit() {
+  var pre = $('audit');
+  pre.textContent = auditEntries.map(function (e) { return hhmmss(e.t) + ' ' + e.line; }).join('\n');
+  pre.scrollTop = pre.scrollHeight;
+}
+
+function renderAll() { renderStatus(); renderCurrent(); renderEdit(); renderButtons(); renderProbe(); }
+
+/* ---------- 探针 ---------- */
+function classify(url, token) {
+  var F = { code: 'format', reason: '地址必须以 wss:// 开头：面板只接受 wss://host[:port]。', next: '检查是否漏写 wss:// 前缀或有多余空格。' };
+  if (!/^wss:\/\//i.test(url)) return F;
+  var u;
+  try { u = new URL(url); } catch (e) { return F; }
+  if (!u.hostname) return F;
+  if (/nosuch|\.invalid/i.test(url)) return { code: 'dns', reason: '域名解析失败（DNS）。', next: '检查域名拼写与 DNS 记录；使用裸 IP 部署时不会出现此错误。' };
+  if (/timeout/i.test(url)) return { code: 'timeout', reason: '探针超时：中继 10 秒内无响应（演示压缩为约 2.6 秒）。', next: '① 确认 VPS 中继服务在运行（systemctl status ra-relay）；② 云防火墙未放行端口时同样表现为持续超时；③ 服务器本机自检：curl --connect-to <ip>:<port>:127.0.0.1:<port> https://…/healthz。' };
+  if (/badcert/i.test(url)) return { code: 'tls', reason: 'TLS 证书校验失败。', next: '裸 IP 证书是 Let\'s Encrypt 7 天短期档、Caddy 自动续期；刚换 IP 时等待重签，或检查中继 TLS 配置路径。' };
+  if ((token === '' && !S.effective.tokenSet) || /wrong/i.test(token)) return { code: 'auth', reason: '令牌被中继拒绝（401）。', next: '核对令牌与中继侧 RELAY_TOKENS 完全一致；复制时注意不要带换行或空格。' };
+  return { code: 'ok', latencyMs: 60 + Math.floor(Math.random() * 200) };
+}
+
+function runProbe(thenApply) {
+  if (probeTimer) { clearTimeout(probeTimer); probeTimer = null; }
+  autoForApply = !!thenApply;
+  var url = $('in-url').value.trim(), token = $('in-token').value;
+  S.probe = { phase: 'pending', result: null };
+  renderButtons(); renderProbe();
+  var r = classify(url, token);
+  var wait = r.code === 'timeout' ? 2600 : (r.code === 'ok' ? 1300 : 1700);
+  probeTimer = setTimeout(function () {
+    probeTimer = null;
+    S.probe = { phase: (r.code === 'ok' ? 'ok' : 'fail'), result: r };
+    if (r.code === 'ok') S.probeInputs = { url: url, tok: token !== '', pub: candPub(url, $('in-public').value) };
+    autoForApply = false;
+    renderProbe(); renderButtons();
+    if (thenApply) {
+      if (r.code === 'ok') openConfirm();
+      else toast('探针未通过，未应用任何更改');
+    }
+  }, wait);
+}
+
+/* ---------- 应用（两步确认） ---------- */
+function requestApply() {
+  if (S.applying || S.killswitch || !S.relayOwned) return;
+  var url = $('in-url').value.trim();
+  var ue = urlError(url);
+  if (!url || ue) return;
+  var token = $('in-token').value, pubField = $('in-public').value;
+  var cand = { url: url, pub: candPub(url, pubField), tokDirty: token !== '' };
+  var noChange = cand.url === S.effective.relayUrl && cand.pub === S.effective.publicUrl && !cand.tokDirty;
+  if (noChange) { toast('没有变更：输入与当前生效配置一致'); return; }
+  var p = S.probe;
+  var valid = p.phase === 'ok' && p.result && p.result.code === 'ok' && S.probeInputs
+    && S.probeInputs.url === cand.url && S.probeInputs.tok === cand.tokDirty && S.probeInputs.pub === cand.pub;
+  if (valid) openConfirm();
+  else runProbe(true); /* 输入已变更或尚无通过结果：先重新探针 */
+}
+
+function openConfirm() {
+  var url = $('in-url').value.trim(), token = $('in-token').value;
+  var pub = candPub(url, $('in-public').value);
+  pending = {
+    url: url, token: token, pub: pub,
+    urlChanged: url !== S.effective.relayUrl,
+    tokChanged: token !== '',
+    pubChanged: pub !== S.effective.publicUrl
+  };
+  $('backdrop').classList.remove('hidden');
+  modalStep(1);
+}
+
+function modalStep(n) {
+  if (!pending) return;
+  var body = $('m-body'), next = $('m-next');
+  if (n === 1) {
+    $('m-title').textContent = '第 1/2 步 · 变更摘要';
+    var pr = S.probe.result;
+    var rows = '';
+    rows += '<div class="d-row"><span class="d-k">中继地址</span><span class="mono">' + esc(S.effective.relayUrl) + '<span class="arrow">→</span>' + esc(pending.url) + (pending.urlChanged ? '' : '<span class="same">（无变化）</span>') + '</span></div>';
+    rows += '<div class="d-row"><span class="d-k">中继令牌</span><span class="mono">' + (pending.tokChanged ? ('将更新 · 指纹变为 sha256:' + fp8(pending.token) + '…（应用后不可查看）') : ('保持不变 · 指纹 sha256:' + S.effective.tokenFp + '…')) + '</span></div>';
+    rows += '<div class="d-row"><span class="d-k">公网入口</span><span class="mono">' + esc(S.effective.publicUrl) + '<span class="arrow">→</span>' + esc(pending.pub) + (pending.pubChanged ? '' : '<span class="same">（无变化）</span>') + '</span></div>';
+    body.innerHTML = '<div class="probe-ok" style="margin-bottom:.7rem">✓ 探针通过 · ' + (pr && pr.latencyMs ? pr.latencyMs : '—') + 'ms</div>' + rows
+      + '<div class="note" style="margin-top:.7rem">确认前请逐行核对。应用流程：服务端复探针 → 原子写 relay-override.json（0600）→ 原地生效 → 重连。</div>';
+    next.textContent = '下一步';
+    next.onclick = function () { modalStep(2); };
+  } else {
+    $('m-title').textContent = '第 2/2 步 · 后果确认';
+    var box;
+    if (pending.pubChanged) {
+      box = '<div class="warn-box"><b>⚠ 换公网入口 = 所有已配对手机都要重新扫码。</b><br>设备私钥保存在手机浏览器的 IndexedDB 中，按 origin 隔离；新入口 = 新 origin = 手机里没有私钥。应用后请到「添加设备」重新生成二维码，逐台重新配对。</div>';
+    } else {
+      box = '<div class="info-box">公网入口未变化：已配对手机不受影响，无需重新扫码。重连期间远程访问会短暂中断（约 1–3 秒）。</div>';
+    }
+    body.innerHTML = box + '<div class="note">应用成功后，审计区将出现 relay.reconfigure 事件（不含令牌本体，仅哈希前缀）。</div>';
+    next.textContent = '确认应用并重连';
+    next.onclick = function () { confirmApply(); };
+  }
+}
+
+function closeModal() { $('backdrop').classList.add('hidden'); pending = null; }
+
+function confirmApply() {
+  var p = pending;
+  if (!p) return;
+  closeModal();
+  S.applying = true;
+  renderButtons();
+  setTimeout(function () {
+    demoToken = p.token || demoToken;
+    S.override = { exists: true, changedAt: Date.now() };
+    S.effective.tokenSet = true;
+    S.effective.tokenFp = fp8(demoToken);
+    S.effective.relayUrl = p.url;
+    S.effective.publicUrl = p.pub;
+    var envShadow = S.sources.relayUrl === 'env';
+    if (!envShadow) S.sources = { relayUrl: 'override', relayToken: 'override', publicUrl: 'override' };
+    S.probeInputs = { url: p.url, tok: false, pub: p.pub };
+    S.repairHint = p.pubChanged;
+    S.applying = false;
+    if (!S.killswitch) S.relay = { state: 'connecting', lastError: null };
+    renderAll();
+    if (envShadow) toast('已写入面板覆盖，但 env 优先级更高，实际生效值未变');
+    else toast('已应用并重连 · relay-override.json 已写入（0600）');
+    auditEntries.push({
+      t: Date.now(),
+      line: JSON.stringify({ kind: 'relay.reconfigure', detail: { relayUrl: p.url, relayPublicUrl: p.pub, tokenFp: 'sha256:' + fp8(demoToken), source: 'panel' } })
+    });
+    renderAudit();
+    setTimeout(function () {
+      if (S.relay.state === 'connecting') { S.relay = { state: 'open', lastError: null }; renderStatus(); }
+    }, 1500);
+  }, 1200);
+}
+
+/* ---------- 事件绑定 ---------- */
+$('in-url').addEventListener('input', function () {
+  S.repairHint = false;
+  var v = this.value.trim();
+  if ($('auto-derive').checked && /^wss:\/\//i.test(v)) $('in-public').value = derive(v);
+  renderEdit(); renderButtons();
+});
+$('in-token').addEventListener('input', function () { S.repairHint = false; renderButtons(); });
+$('in-public').addEventListener('input', function () { $('auto-derive').checked = false; S.repairHint = false; renderEdit(); renderButtons(); });
+$('auto-derive').addEventListener('change', function () {
+  if (this.checked) {
+    var v = $('in-url').value.trim();
+    if (/^wss:\/\//i.test(v)) $('in-public').value = derive(v);
+  }
+});
+$('btn-eye').onclick = function () {
+  var t = $('in-token');
+  var show = t.type === 'password';
+  t.type = show ? 'text' : 'password';
+  this.textContent = show ? '隐藏' : '显示';
+};
+$('btn-probe').onclick = function () { runProbe(false); };
+$('btn-apply').onclick = requestApply;
+['in-url', 'in-token', 'in-public'].forEach(function (id) {
+  $(id).addEventListener('keydown', function (e) {
+    if (e.key === 'Enter') { e.preventDefault(); if (!$('btn-probe').disabled) runProbe(false); }
+  });
+});
+$('m-cancel').onclick = closeModal;
+$('backdrop').addEventListener('click', function (e) { if (e.target === $('backdrop')) closeModal(); });
+document.addEventListener('keydown', function (e) {
+  if (e.key === 'Escape' && !$('backdrop').classList.contains('hidden')) { e.stopPropagation(); closeModal(); }
+});
+$('btn-back').onclick = function () { toast('原型：此处跳转 DSH 首页'); };
+
+/* ---------- 场景控制 ---------- */
+function resetDemo(silent) {
+  if (probeTimer) { clearTimeout(probeTimer); probeTimer = null; }
+  autoForApply = false;
+  demoToken = 'demo-token-2026';
+  S = freshState();
+  $('in-url').value = ''; $('in-token').value = ''; $('in-public').value = '';
+  $('in-token').type = 'password'; $('btn-eye').textContent = '显示';
+  $('auto-derive').checked = true;
+  renderAll();
+  if (!silent) toast('已重置演示');
+}
+$('sc-reset').onclick = function () { resetDemo(true); toast('场景：patch 来源（默认）'); };
+$('sc-env').onclick = function () { resetDemo(true); S.sources = { relayUrl: 'env', relayToken: 'env', publicUrl: 'env' }; renderAll(); toast('场景：env 变量生效（面板编辑被遮蔽）'); };
+$('sc-killed').onclick = function () { resetDemo(true); S.killswitch = true; S.relay = { state: 'killed', lastError: null }; renderAll(); toast('场景：kill switch 已启用（应用并重连被禁用）'); };
+
+/* ---------- Toast ---------- */
+function toast(msg) {
+  var t = $('toast');
+  t.textContent = msg;
+  t.classList.remove('hidden');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(function () { t.classList.add('hidden'); }, 2800);
+}
+
+/* ---------- 启动 ---------- */
+resetDemo(true);
+renderAudit();
+</script>
+</body>
+</html>
