@@ -344,11 +344,25 @@ function handlePhoneHttp(req, res) {
     const rawCookie = typeof req.headers.cookie === 'string' ? req.headers.cookie : '';
     const hasDeviceCookie = /(^|;\s*)ra-device=/.test(rawCookie);
     console.log(`[ra-relay] 未路由 ${req.method} ${url.pathname} c=${url.searchParams.get('c') ?? '(无)'} cookieHint=${routeHintFromCookie(req.headers.cookie) ?? '(无)'} hasRaDevice=${hasDeviceCookie} cookieNames=[${rawCookie.split(';').map((s) => s.split('=')[0].trim()).filter(Boolean).join(',')}] connectors=${connectors.size} devices=${devices.size}`);
-    // 兜底：带了 ra-device 但解析失败（例如旧格式票据）→ 仍投给唯一连接器（由它验签裁决）
+    // ★ 兜底：带了 ra-device 但解析失败（例如旧格式票据）—— 不能在这里「路由」。
+    //   真机事故 2026-10-02：这里原本写的是 `return { ws: first[1], deviceId: 'pair' };`
+    //   但本函数返回 void（第 780 行 handler 直接丢弃返回值），且**没有任何 res 写入** ——
+    //   于是请求既不转发也不应答，socket 上什么都不发生，手机一直转到超时
+    //   （实测 HTTP 000 / 12s，连试三次全中；不带 cookie 同一 URL 立刻 401）。
+    //   这正是「配对完成后卡在进入 DSH」的第二种成因：票据在设备表里查不到路由键时，
+    //   旧实现把请求吞掉了。正确做法是**应答**，让客户端立刻拿到可读结论而不是挂死：
+    //   设备票据由连接器验签裁决，但连接器都还没收到请求，谈不上裁决。
+    //   直接回 401 配对引导（与连接器侧 pairRequiredPage 的语义一致）。
     if (hasDeviceCookie && connectors.size > 0) {
-      const first = connectors.entries().next().value;
       metrics.rejected += 1;
-      return { ws: first[1], deviceId: 'pair' };
+      console.log(`[ra-relay] ra-device 无法解析为路由键且非单连接器兜底场景 → 401 配对引导（不再静默吞掉请求）`);
+      res.writeHead(401, {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'no-store, no-cache, must-revalidate, max-age=0',
+        pragma: 'no-cache'
+      });
+      res.end(renderRelayHint({ hasConnector: true, path: url.pathname }));
+      return;
     }
     metrics.rejected += 1;
     res.writeHead(503, {

@@ -307,3 +307,48 @@ test('中继：不回 pong 的僵尸连接器被 keepalive 剔除，健康连接
     relay?.kill();
   }
 }, { timeout: 20000 });
+
+test('中继：无法路由的 ra-device 必须立刻应答，不得静默吞掉请求（2026-10-02 挂死回归）', async (t) => {
+  // 真机事故：无确定路由键、但 cookie 里带着 ra-device 的请求，旧实现走到
+  //   `return { ws: first[1], deviceId: 'pair' }`
+  // ——而 handlePhoneHttp 返回 void，且这条分支没有任何 res 写入。于是请求既不转发
+  //   也不应答，socket 上永远没有响应：实测 HTTP 000（12s 超时，连试三次全中），
+  //   手机表现为「配对完成后卡在进入 DSH」。同一 URL 去掉 cookie 则立刻 401。
+  //
+  // 复现条件要凑齐两条：① cookie 里有 ra-device 但中继解析不出 deviceId 路由键；
+  // ② 连接器数量 ≠ 1（否则走单连接器兜底，压根到不了这条分支）。
+  let relay;
+  let connectorA;
+  let connectorB;
+  try {
+    relay = await startRelay();
+    t.after(() => {
+      connectorA?.close();
+      connectorB?.close();
+      relay?.kill();
+    });
+    connectorA = await connectConnector('rescue-a');
+    connectorB = await connectConnector('rescue-b');
+
+    // 畸形 ra-device：v1 前缀但 payload 解不出 deviceId → routeHintFromCookie 返回 null，
+    // 而 hasDeviceCookie 为真。c= 也不给，两个候选键都不存在 → 命中该分支。
+    const malformed = 'ra-device=v1.bm90LWpzb24.AAAA';
+    const started = Date.now();
+    const res = await fetch(`http://127.0.0.1:${resolvedPort}/?x=1`, {
+      headers: { cookie: malformed },
+      signal: AbortSignal.timeout(5000)
+    });
+    const elapsed = Date.now() - started;
+
+    // 核心断言：有响应（不是挂死）。旧实现这里会抛 AbortError（5s 超时）。
+    assert.ok(res.status === 401 || res.status === 503,
+      `无法路由的 ra-device 请求必须得到明确应答，实际 HTTP ${res.status}`);
+    assert.ok(elapsed < 3000, `应答必须及时（不得等客户端超时），实际 ${elapsed}ms`);
+    const body = await res.text();
+    assert.match(body, /需要配对|连接器不在线/, '应回可读的配对/离线引导页，而不是空响应');
+  } finally {
+    connectorA?.close();
+    connectorB?.close();
+    relay?.kill();
+  }
+}, { timeout: 20000 });
