@@ -1,0 +1,751 @@
+/**
+ * dsh-kite 公网中继（方案 §9）。
+ *
+ * 职责边界（严格）：接受 Connector 出站 WSS（Bearer 鉴权）；接受手机 WSS 升级与
+ * 普通 HTTPS 请求并按路由转发；限流、连接上限、帧大小上限；健康检查与指标。
+ * 绝不做：不持有设备公钥、不解密 sealed 帧、不持久化消息、不做信任判断 ——
+ * 中继是可用性组件，不是安全组件（真正的 ACL 校验在 Connector）。
+ *
+ * 路由模型：
+ *   /connector      Connector 出站 WSS（子协议 ra-bearer.<token>；?c=<connectorId>）
+ *   /device         thin client 信令通道（pair/auth/sealed 帧 opaque 直通）
+ *   其它任意路径    手机 PWA：HTTP → http-head/body 帧；WS 升级 → ws-open 桥
+ *
+ * 手机路由无需信任：deviceId 从 ra-device cookie 的 payload 段 best-effort 解出
+ * （仅作路由提示；真伪由 Connector 的票据验签兜底）；配对链接带 ?c=<connectorId>。
+ *
+ * 环境变量：
+ *   PORT                监听端口（默认 8787）
+ *   TLS_KEY / TLS_CERT  PEM 路径（生产必配；或前置 caddy/nginx 终结 TLS）
+ *   RELAY_TOKENS        逗号分隔接入令牌（空 = 开放，仅限本地开发）
+ *   MAX_DEVICES         单连接器设备上限（默认 8）
+ *   MAX_PHONE_PER_DEVICE 单设备并发手机 socket 上限（默认 4）
+ */
+import http from 'http';
+import https from 'https';
+import { readFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
+import { WebSocketServer } from 'ws';
+import { gzipSync } from 'node:zlib';
+
+// 守护弹性：中继是可用性组件，未捕获异常/拒绝只记日志不退出（launchd KeepAlive 之外的二道防线）。
+process.on('uncaughtException', (err) => console.error('[ra-relay] uncaught:', err?.stack || err));
+process.on('unhandledRejection', (err) => console.error('[ra-relay] unhandled rejection:', err?.stack || err));
+
+const PORT = Number(process.env.PORT || 8787);
+const RELAY_TOKENS = new Set(String(process.env.RELAY_TOKENS ?? '').split(',').map((s) => s.trim()).filter(Boolean));
+const MAX_DEVICES = Number(process.env.MAX_DEVICES || 8);
+const MAX_PHONE_PER_DEVICE = Number(process.env.MAX_PHONE_PER_DEVICE || 4);
+const MAX_FRAME_BYTES = 1024 * 1024;
+/**
+ * ★ ws 层的 maxPayload 必须【严格大于】应用层的 MAX_FRAME_BYTES，不能相等（2026-10-01 根治）。
+ *
+ * 相等时会发生什么：超限帧在 ws 解析层就被拒并抛 error → 以 1009 掐断【整条连接】，
+ * 所有流同时死；而且因为 message 事件从不触发，我们连它的体积都记不下来 ——
+ * 真机现场正是如此：客户端报 entry before opening cursor / skipped revision，
+ * 服务器侧 largestFrameBytes 却只显示 568KB（更大的帧从未进过账）。
+ *
+ * 留出余量后，超大帧会走到应用层：被计数、被记下体积、按帧丢弃，连接与其他流都不受影响。
+ * 16 MiB 是给 base64（膨胀 4/3）和信封字段留的余量，不是留给 DSH 消息的 ——
+ * DSH 消息由连接器侧分片控制在 512 KiB 以内，走不到这里。
+ */
+const MAX_WIRE_FRAME_BYTES = 16 * 1024 * 1024;
+const MAX_BODY_BYTES = 8 * 1024 * 1024;
+/** 单条桥的下行积压上限（超过则关闭该桥，让客户端重连并用 session 游标追平）。 */
+const MAX_PHONE_BUFFER_BYTES = 8 * 1024 * 1024;
+/** WebSocket 发送缓冲上限（连接器/手机任一侧超限即拒发，避免静默丢帧）。 */
+const MAX_SOCKET_BUFFER_BYTES = 8 * 1024 * 1024;
+const REQUEST_TIMEOUT_MS = 110_000; // 高于 Cloudflare 524 阈值（100s），保证我们能先给出明确错误而非 CF 超时页
+const CONNECT_RATE = { windowMs: 60_000, max: 60 };
+
+const metrics = {
+  connectorConnects: 0, phoneConnects: 0, httpRequests: 0, wsBridges: 0, rejected: 0,
+  bytesRelayed: 0, startedAt: Date.now(),
+  // ---- 丢帧观测（P0，2026-10-01）------------------------------------------------
+  // 动因：客户端报「session assistant stream skipped revision N」时，服务器侧零证据 ——
+  // 因为下面这些丢帧/断连路径以前全是静默的：
+  //   ① send() 超限/缓冲满 → 返回 false，调用方普遍忽略返回值
+  //   ② 入站超大帧 → 直接 return（实际上 maxPayload 先生效，见 ③）
+  //   ③ maxPayload === MAX_FRAME_BYTES → 超大帧让 ws 抛 error，整条连接死掉（1009）
+  //      且当时没有任何 ws.on('error')，只能被全局 uncaughtException 兜住，连接级上下文全丢
+  //   ④ 下行/上行积压超限 → 主动 close(1013)，客户端重连后 resume
+  // 诊断「差一帧」这类故障，缺的就是这几组的计数与首次样本。
+  dropped: 0,
+  droppedByReason: new Map(),
+  closesByCode: new Map(),
+  largestFrameBytes: 0
+};
+
+/** 记录见过的最大帧。判断「是不是撞上 MAX_FRAME_BYTES」全看它。 */
+function noteFrame(bytes) {
+  if (bytes > metrics.largestFrameBytes) metrics.largestFrameBytes = bytes;
+}
+
+/**
+ * 记一次丢帧。返回值恒为 false，方便 `return recordDrop(...)` 就地替换旧的无信号 return。
+ * ★ 日志必须限流：一次风暴能瞬间刷爆 journald，反而把首因冲掉。
+ *   策略：每个 reason 前 5 次逐条记（拿到首因与首个样本），之后每 100 次记一条。
+ */
+function recordDrop(reason, detail) {
+  const entry = metrics.droppedByReason.get(reason) ?? { count: 0, firstAt: Date.now(), lastAt: 0, sample: null };
+  entry.count += 1;
+  entry.lastAt = Date.now();
+  if (detail) entry.sample = detail;
+  metrics.droppedByReason.set(reason, entry);
+  metrics.dropped += 1;
+  if (entry.count <= 5 || entry.count % 100 === 0) {
+    console.log(`[ra-relay] 丢帧 reason=${reason} count=${entry.count}${detail ? ` ${JSON.stringify(detail)}` : ''}`);
+  }
+  return false;
+}
+
+/** 记一次连接关闭。只对非正常码（非 1000/1001）计数 —— 1006/1009/1013 才是要找的东西。 */
+function recordClose(peer, code, reason) {
+  const key = `${peer}:${code}`;
+  const entry = metrics.closesByCode.get(key) ?? { count: 0, lastAt: 0, sample: null };
+  entry.count += 1;
+  entry.lastAt = Date.now();
+  entry.sample = String(reason ?? '').slice(0, 120);
+  metrics.closesByCode.set(key, entry);
+  if (code !== 1000 && code !== 1001) {
+    console.log(`[ra-relay] 连接关闭 peer=${peer} code=${code} reason=${entry.sample}（非正常，累计 ${entry.count}）`);
+  }
+}
+
+/** connectorId → connector ws */
+const connectors = new Map();
+/** deviceId → { connectorId, phones:Set<ws> } */
+const devices = new Map();
+/**
+ * streamId → 挂起会话：{ res? , phone?, timer?, connectorId }
+ * 另有两个信令键：`pair:<channel>` 与 `ch:<channel>` → { phone }
+ */
+const streams = new Map();
+/** 每 IP 连接速率 */
+const connectRate = new Map();
+
+function rateLimit(ip) {
+  const now = Date.now();
+  let entry = connectRate.get(ip);
+  if (!entry || now - entry.start > CONNECT_RATE.windowMs) {
+    entry = { start: now, count: 0 };
+    connectRate.set(ip, entry);
+  }
+  entry.count += 1;
+  return entry.count <= CONNECT_RATE.max;
+}
+
+/**
+ * 发送一帧。★ 必须做背压检查：
+ * 旧实现忽略 ws 的发送缓冲，直接 ws.send() 并恒返回 true —— 大会话（如 39 轮
+ * 715 步）推送高频 assistant-stream 帧时缓冲膨胀，极端情况下丢帧，表现为客户端
+ * 「session assistant stream skipped revision N」（真机事故 2026-10-01）。
+ * @returns false 表示未发送（调用方须决定重试/断连，不得静默丢弃）。
+ *
+ * ★ P0（2026-10-01）：旧实现三处 `return false` 全无信号，而调用方（552/568 等）
+ *   普遍不检查返回值 —— 于是「帧被丢掉」这件事在服务器侧完全不可见。
+ *   现在每个分支出处都带 reason 落进 recordDrop，再也不会无声。
+ */
+function send(ws, frame) {
+  if (!ws || ws.readyState !== 1) {
+    return recordDrop('socket_not_open', { readyState: ws?.readyState ?? null, kind: frame?.kind });
+  }
+  const text = JSON.stringify(frame);
+  const size = Buffer.byteLength(text);
+  noteFrame(size);
+  if (size > MAX_FRAME_BYTES) {
+    return recordDrop('outbound_frame_too_large', { size, limit: MAX_FRAME_BYTES, kind: frame?.kind });
+  }
+  // 背压：超过上限时拒绝本次发送（调用方会断开桥，让客户端用 session 游标追平，
+  // 而不是让帧在内存里无限排队直至乱序/丢失）。
+  if (ws.bufferedAmount > MAX_SOCKET_BUFFER_BYTES) {
+    return recordDrop('socket_buffer_full', { bufferedAmount: ws.bufferedAmount, size, kind: frame?.kind });
+  }
+  metrics.bytesRelayed += size;
+  ws.send(text);
+  return true;
+}
+
+/** 从 ra-device cookie（`v1.<body>.<sig>`）best-effort 解 deviceId（只作路由提示）。 */
+function routeHintFromCookie(header) {
+  if (typeof header !== 'string') return null;
+  for (const segment of header.split(';')) {
+    const at = segment.indexOf('=');
+    if (at === -1 || segment.slice(0, at).trim() !== 'ra-device') continue;
+    const parts = segment.slice(at + 1).trim().split('.');
+    if (parts.length !== 3 || parts[0] !== 'v1') return null;
+    try {
+      const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+      return typeof payload.deviceId === 'string' ? payload.deviceId : null;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/** 解析某请求/升级应发往的 connector ws（cookie deviceId → 配对链接 c= → connectorId 直配）。 */
+function connectorFor(req, url) {
+  const hint = routeHintFromCookie(req.headers.cookie) ?? url.searchParams.get('c');
+  if (hint) {
+    const entry = devices.get(hint);
+    if (entry) {
+      const ws = connectors.get(entry.connectorId);
+      if (ws) return { ws, deviceId: hint };
+    }
+    if (connectors.has(hint)) return { ws: connectors.get(hint), deviceId: 'pair' };
+    // hint 存在但查不到映射 → 继续走兜底（设备表可能刚更新、cookie 可能陈旧）。
+    // ★ 真机事故 2026-09-30：旧实现只认「hint 完全为空」才兜底，导致带陈旧 cookie
+    //   的真实请求被拒（界面卡在「重新连接中…」、每次请求都要等超时）。
+  }
+
+  // ★ 兜底：单连接器场景（本插件最常见部署形态）下，把请求投给唯一的在线连接器。
+  //   中继不做信任判断 —— 真正的准入仍由连接器验签（ticket）裁决，中继只是转发。
+  if (connectors.size === 1) {
+    const first = connectors.entries().next().value;
+    return { ws: first[1], deviceId: hint ?? 'pair' };
+  }
+
+  // 多连接器时的配对路径兜底（配对阶段尚无有效凭据）：
+  if (connectors.size > 1
+      && (url.pathname === '/kite/pair' || url.pathname.startsWith('/kite/pair/')
+          || url.pathname === '/kite/welcome')) {
+    const first = connectors.entries().next().value;
+    return { ws: first[1], deviceId: 'pair' };
+  }
+  return null;
+}
+
+// ---- HTTP 面 ----
+
+function handleHealth(res) {
+  // dropped / largestFrameBytes 一并暴露：手机上打不开 /metrics，但 /healthz 是常用入口，
+  // 这两个数就是「有没有丢帧、最大帧离 1 MiB 上限还有多远」的现场快照。
+  const droppedByReason = {};
+  for (const [reason, entry] of metrics.droppedByReason) droppedByReason[reason] = entry.count;
+  res.writeHead(200, { 'content-type': 'application/json' });
+  res.end(JSON.stringify({
+    ok: true,
+    connectors: connectors.size,
+    devices: devices.size,
+    uptimeMs: Date.now() - metrics.startedAt,
+    dropped: metrics.dropped,
+    droppedByReason,
+    largestFrameBytes: metrics.largestFrameBytes,
+    frameLimitBytes: MAX_FRAME_BYTES
+  }));
+}
+
+function handleMetrics(res) {
+  const uptime = Math.floor((Date.now() - metrics.startedAt) / 1000);
+  const lines = [
+    '# TYPE ra_relay_connectors gauge', `ra_relay_connectors ${connectors.size}`,
+    '# TYPE ra_relay_devices gauge', `ra_relay_devices ${devices.size}`,
+    '# TYPE ra_relay_http_requests_total counter', `ra_relay_http_requests_total ${metrics.httpRequests}`,
+    '# TYPE ra_relay_ws_bridges_total counter', `ra_relay_ws_bridges_total ${metrics.wsBridges}`,
+    '# TYPE ra_relay_rejected_total counter', `ra_relay_rejected_total ${metrics.rejected}`,
+    '# TYPE ra_relay_bytes_total counter', `ra_relay_bytes_total ${metrics.bytesRelayed}`,
+    '# TYPE ra_relay_uptime_seconds gauge', `ra_relay_uptime_seconds ${uptime}`,
+    // ---- 丢帧观测（P0）----
+    '# TYPE ra_relay_dropped_total counter', `ra_relay_dropped_total ${metrics.dropped}`,
+    '# TYPE ra_relay_largest_frame_bytes gauge',
+    `ra_relay_largest_frame_bytes ${metrics.largestFrameBytes}`,
+    '# TYPE ra_relay_frame_limit_bytes gauge', `ra_relay_frame_limit_bytes ${MAX_FRAME_BYTES}`,
+    '# TYPE ra_relay_wire_frame_limit_bytes gauge', `ra_relay_wire_frame_limit_bytes ${MAX_WIRE_FRAME_BYTES}`,
+    // 带 label 的两个家族：TYPE 行必须**只出现一次**，不能跟着样本一起循环发
+    // （重复 TYPE 行不是合法 Prometheus 文本；初版就是循环里发的，已由测试反证）。
+    '# TYPE ra_relay_dropped_by_reason_total counter',
+    '# TYPE ra_relay_ws_close_total counter'
+  ];
+  for (const [reason, entry] of [...metrics.droppedByReason].sort((a, b) => b[1].count - a[1].count)) {
+    lines.push(`ra_relay_dropped_by_reason_total{reason="${reason}"} ${entry.count}`);
+  }
+  for (const [key, entry] of [...metrics.closesByCode].sort((a, b) => b[1].count - a[1].count)) {
+    const [peer, code] = key.split(':');
+    lines.push(`ra_relay_ws_close_total{peer="${peer}",code="${code}"} ${entry.count}`);
+  }
+  lines.push('');
+  res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4' });
+  res.end(lines.join('\n'));
+}
+
+
+/**
+ * 中继的未路由提示页：区分三种情况，让用户自助定位，而不是只看到一句「未就绪」。
+ *   ① 有连接器在线 + 裸访问根路径 → 说明需要先在桌面端生成配对链接
+ *   ② 无连接器在线 → 桌面 DSH 的连接器没连上（提示检查面板徽章）
+ *   ③ 带了配对参数但无人接 → 链接过期或被替换
+ */
+function renderRelayHint({ hasConnector, path }) {
+  const isBare = path === '/' || path === '';
+  const title = hasConnector ? '需要配对链接' : 'DSH 连接器不在线';
+  const body = isBare
+    ? (hasConnector
+      ? '本中继已连接到一个 DSH 实例，但本页面没有携带配对/设备凭据。<br><br>请在桌面端 DSH 打开「<b>手机远程</b>」面板（右下角悬浮按钮），点「生成配对二维码」，然后用手机扫描二维码打开——那才是正确的入口。'
+      : '桌面端 DSH 没有连上中继。<br><br>请在桌面端打开「<b>手机远程</b>」面板确认状态徽章是「已连接」；若显示「待机」或「重试中」，检查插件配置里的 relayUrl / relayToken 是否与中继一致，然后重启 DSH。')
+    : '该配对链接已失效或已被替换。<br><br>配对链接 2 分钟内有效且一次性使用。请在桌面端「<b>手机远程</b>」面板重新生成。<br><br><button onclick="location.reload()" style="margin-top:1rem;padding:.6rem 1.1rem;border:1px solid #2f81f7;background:#2f81f7;color:#fff;border-radius:.5rem;font-size:.95rem;cursor:pointer">重新加载本页</button>';
+  return `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DSH 远程访问</title></head>
+<body style="font-family:system-ui,-apple-system,sans-serif;background:#0e1116;color:#e6e8eb;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0;padding:1.5rem;box-sizing:border-box">
+<main style="max-width:28rem;line-height:1.75"><h1 style="font-size:1.35rem;margin:0 0 1rem">${title}</h1><p style="color:#9aa4b2;margin:0">${body}</p></main></body></html>`;
+}
+
+function handlePhoneHttp(req, res) {
+  const url = new URL(req.url ?? '/', 'http://x');
+  if (url.pathname === '/healthz') return handleHealth(res);
+  if (url.pathname === '/metrics') return handleMetrics(res);
+  // ★ 只对 HTML/API 禁止缓存（配对页、状态接口必须新鲜）；静态资源放行浏览器缓存。
+  //   真机事故 2026-10-01：全局 no-store 导致 57 个客户端模块（~10MB）每次刷新全量重下，
+  //   经隧道要 100+ 秒 → 表现为「同步很慢」。资源 URL 带 ?rev= 指纹，可安全长缓存。
+  const isAsset = /\/(assets|plugins)\/|\.(js|mjs|css|map|woff2?|ttf|png|jpe?g|svg|webp|ico|wasm)(\?|$)/i.test(url.pathname);
+  if (!isAsset) {
+    res.setHeader('cache-control', 'no-store, no-cache, must-revalidate, max-age=0');
+    res.setHeader('pragma', 'no-cache');
+  }
+  metrics.httpRequests += 1;
+  const routed = connectorFor(req, url);
+  if (!routed?.ws) {
+    // 诊断：未路由请求记录关键事实（不含敏感值），便于定位是 c 缺失/错配还是连接器离线。
+    const rawCookie = typeof req.headers.cookie === 'string' ? req.headers.cookie : '';
+    const hasDeviceCookie = /(^|;\s*)ra-device=/.test(rawCookie);
+    console.log(`[ra-relay] 未路由 ${req.method} ${url.pathname} c=${url.searchParams.get('c') ?? '(无)'} cookieHint=${routeHintFromCookie(req.headers.cookie) ?? '(无)'} hasRaDevice=${hasDeviceCookie} cookieNames=[${rawCookie.split(';').map((s) => s.split('=')[0].trim()).filter(Boolean).join(',')}] connectors=${connectors.size} devices=${devices.size}`);
+    // 兜底：带了 ra-device 但解析失败（例如旧格式票据）→ 仍投给唯一连接器（由它验签裁决）
+    if (hasDeviceCookie && connectors.size > 0) {
+      const first = connectors.entries().next().value;
+      metrics.rejected += 1;
+      return { ws: first[1], deviceId: 'pair' };
+    }
+    metrics.rejected += 1;
+    res.writeHead(503, {
+      'content-type': 'text/html; charset=utf-8',
+      'cache-control': 'no-store, no-cache, must-revalidate, max-age=0',
+      pragma: 'no-cache',
+      expires: '0',
+      vary: '*'
+    });
+    res.end(renderRelayHint({ hasConnector: connectors.size > 0, path: url.pathname }));
+    return;
+  }
+  const connector = routed.ws;
+  const routeDeviceId = routed.deviceId;
+  const streamId = randomUUID();
+  const chunks = [];
+  let size = 0;
+  let aborted = false;
+  let settled = false;
+
+  // ★ 看门狗只覆盖「等连接器回应」阶段；一旦响应头到达就清除（流式/长请求可能远超此值）。
+  //   旧实现的 30s 会在长请求上误杀，表现为 Cloudflare 524 / context canceled / EOF
+  //   （真机事故 2026-09-30：DSH 的 /api/session/list 等接口响应较慢）。
+  const timer = setTimeout(() => {
+    if (settled) return;
+    settled = true;
+    streams.delete(streamId);
+    res.writeHead(504, { 'content-type': 'text/plain' });
+    res.end('connector timeout');
+  }, REQUEST_TIMEOUT_MS);
+
+  res.on('close', () => {
+    // close 在响应正常结束后也会触发；这里只清理**尚未拿到响应头**的挂起流，
+    // 避免把仍在途的连接器响应误判为取消。
+    clearTimeout(timer);
+    if (!settled) streams.delete(streamId);
+    else streams.delete(streamId);
+  });
+  req.on('error', () => streams.delete(streamId));
+  req.on('data', (chunk) => {
+    if (aborted) return;
+    size += chunk.length;
+    if (size > MAX_BODY_BYTES) {
+      aborted = true;
+      clearTimeout(timer);
+      streams.delete(streamId);
+      res.writeHead(413, { 'content-type': 'text/plain' });
+      res.end('body too large for relay');
+      return;
+    }
+    chunks.push(chunk);
+  });
+  req.on('end', () => {
+    if (aborted) return;
+    const body = Buffer.concat(chunks);
+    streams.set(streamId, { res, connectorId: routeDeviceId, resourceUrl: req.url ?? '/' });
+    const head = {
+      kind: 'http-head',
+      deviceId: routeDeviceId,
+      streamId,
+      method: req.method ?? 'GET',
+      path: req.url ?? '/',
+      headers: {
+        cookie: typeof req.headers.cookie === 'string' ? req.headers.cookie : '',
+        'content-type': typeof req.headers['content-type'] === 'string' ? req.headers['content-type'] : '',
+        // ★ 客户端是否接受 gzip —— 连接器据此决定是否压缩响应（DSH 桌面壳覆盖了
+        //   webserver 的 compression 配置，上游不压缩，由连接器补做以降低隧道传输量）。
+        //   这是中继→连接器的内部头，不经代理白名单，不影响「转发给 DSH 的头集合」契约。
+        'accept-encoding': typeof req.headers['accept-encoding'] === 'string' ? req.headers['accept-encoding'] : ''
+      }
+    };
+    if (!send(connector, head)) {
+      clearTimeout(timer);
+      streams.delete(streamId);
+      if (!settled) {
+        settled = true;
+        res.writeHead(502, { 'content-type': 'text/plain' });
+        res.end('connector offline');
+      }
+      return;
+    }
+    // 分片发送（≤256KiB 原始字节，避免超 1 MiB 帧上限被静默丢弃）；空 body 也发 final 帧。
+    const CHUNK = 256 * 1024;
+    for (let offset = 0; offset < body.length || offset === 0; offset += CHUNK) {
+      const piece = body.subarray(offset, offset + CHUNK);
+      const final = offset + CHUNK >= body.length;
+      if (!send(connector, { kind: 'http-body', deviceId: routeDeviceId, streamId, chunk: piece.toString('base64url'), final })) break;
+      if (final) break;
+    }
+  });
+}
+
+// ---- WebSocket 面 ----
+
+// maxPayload 用【线上帧上限】而非应用层上限 —— 见 MAX_WIRE_FRAME_BYTES 的说明。
+const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_WIRE_FRAME_BYTES });
+
+function bearerFromProtocols(protocols) {
+  for (const proto of protocols ?? []) {
+    if (typeof proto === 'string' && proto.startsWith('ra-bearer.')) return proto.slice('ra-bearer.'.length);
+  }
+  return null;
+}
+
+function handleUpgrade(req, socket, head) {
+  const url = new URL(req.url ?? '/', 'http://x');
+  if (url.pathname === '/connector') {
+    const token = bearerFromProtocols(req.headers['sec-websocket-protocol']?.split(/,\s*/)) ?? url.searchParams.get('token');
+    if (RELAY_TOKENS.size > 0 && (!token || !RELAY_TOKENS.has(token))) {
+      metrics.rejected += 1;
+      socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+      return;
+    }
+    wss.handleUpgrade(req, socket, head, (ws) => onConnector(ws, url));
+    return;
+  }
+  // 手机侧：任意路径的升级（/device 信令通道，或 /api/remote.mux 等 PWA WS）都桥到 connector。
+  wss.handleUpgrade(req, socket, head, (ws) => onPhoneSocket(ws, url, req));
+}
+
+function onConnector(ws, url) {
+  const connectorId = url.searchParams.get('c');
+  if (!connectorId) {
+    ws.close(4400, 'missing connector id');
+    return;
+  }
+  metrics.connectorConnects += 1;
+  connectors.get(connectorId)?.close(4000, 'replaced');
+  connectors.set(connectorId, ws);
+  for (const entry of devices.values()) {
+    if (entry.connectorId === connectorId) entry.connectorId = connectorId; // 重连后路由已由 key 对齐
+  }
+  send(ws, { kind: 'hello-ack', proto: 1, caps: ['http', 'ws', 'pair', 'auth'] });
+
+  // ★ maxPayload === MAX_FRAME_BYTES，所以超大帧会在 ws 解析层就被拒并抛 error，
+  //   根本走不到下面那句 data.length 检查（那句实际是死代码，保留作二道防线）。
+  //   没有 error 处理时，这个 error 只能被全局 uncaughtException 兜住 ——
+  //   连接死了、断在哪、死因是什么，全部丢失。这是 P0 里最关键的一个补点。
+  ws.on('error', (error) => {
+    recordDrop('ws_error', {
+      peer: 'connector',
+      connectorId: connectorId.slice(0, 12),
+      code: error?.code ?? null,
+      message: String(error?.message ?? error).slice(0, 200)
+    });
+  });
+
+  ws.on('message', (data) => {
+    noteFrame(data.length);
+    if (data.length > MAX_FRAME_BYTES) {
+      recordDrop('inbound_frame_too_large', { dir: 'connector', size: data.length, limit: MAX_FRAME_BYTES });
+      return;
+    }
+    let frame;
+    try {
+      frame = JSON.parse(data.toString('utf8'));
+    } catch {
+      recordDrop('bad_json', { dir: 'connector', size: data.length });
+      ws.close(1002, 'bad json');
+      return;
+    }
+    relayConnectorFrame(ws, frame);
+  });
+
+  ws.on('close', (code, reason) => {
+    recordClose('connector', code, reason);
+    if (connectors.get(connectorId) === ws) connectors.delete(connectorId);
+    for (const [deviceId, entry] of [...devices]) {
+      if (entry.connectorId === connectorId) {
+        for (const phone of entry.phones) {
+          if (phone.readyState === 1) phone.close(1001, 'connector offline');
+        }
+        devices.delete(deviceId);
+      }
+    }
+    for (const [streamId, stream] of [...streams]) {
+      if (stream.connectorId !== connectorId && stream.res === undefined && stream.phone === undefined) continue;
+      // 只清理属于该 connector 的挂起项：http 流用 res，PWA 桥用 phone。
+      const isThisConnector = (stream.connectorId === connectorId) || (stream.res !== undefined);
+      if (!isThisConnector) continue;
+      clearTimeout(stream.timer);
+      if (stream.res && !stream.res.destroyed) {
+        stream.res.writeHead(502, { 'content-type': 'text/plain' });
+        stream.res.end('connector disconnected');
+      }
+      if (stream.phone && stream.phone.readyState === 1) stream.phone.close(1001, 'connector offline');
+      streams.delete(streamId);
+    }
+  });
+}
+
+/** Connector → 手机方向帧路由。 */
+/** 反查某连接器 ws 对应的 connectorId。 */
+function connectorIdOf(ws) {
+  for (const [id, sock] of connectors) if (sock === ws) return id;
+  return null;
+}
+
+function relayConnectorFrame(connectorWs, frame) {
+  const kind = frame.kind;
+  if (kind === 'http-res-head' || kind === 'http-res-body' || kind === 'http-error') {
+    const stream = streams.get(frame.streamId);
+    if (!stream?.res || stream.res.destroyed) {
+      streams.delete(frame.streamId);
+      return;
+    }
+    if (kind === 'http-res-head') {
+      clearTimeout(stream.timer);
+      const headers = { ...(frame.headers ?? {}) };
+      if (!headers['content-type']) headers['content-type'] = 'application/octet-stream';
+      // ★ 带指纹的资源（?rev=xxx / /assets/xxx-hash.js）允许浏览器强缓存：
+      //   内容是内容寻址的，换版本必换 URL，因此可 immutable。这直接消除
+      //   「每次刷新重下 0.4MB+、经隧道要 20s」的核心痛点（真机 2026-10-01）。
+      const url = stream.resourceUrl || '';
+      const fingerprint = /(?:\?|&)rev=/.test(url) || /\/assets\/[^/]+-[A-Za-z0-9_-]{8,}\./.test(url);
+      if (fingerprint && !frame.headers?.['cache-control']) {
+        headers['cache-control'] = 'public, max-age=31536000, immutable';
+      }
+      stream.pendingHeaders = headers;
+      stream.res.writeHead(frame.status ?? 502, headers);
+      return;
+    }
+    if (kind === 'http-res-body') {
+      const chunk = Buffer.from(frame.chunk ?? '', 'base64url');
+      metrics.bytesRelayed += chunk.length;
+      if (frame.final) {
+        stream.res.end(chunk);
+        streams.delete(frame.streamId);
+      } else {
+        stream.res.write(chunk);
+      }
+      return;
+    }
+    // 业务错误按插件给的 status 回（4xx），仅真正未知回 502 —— 避免被 Cloudflare 用
+    // 自有 HTML 覆盖而让前端 JSON 解析崩溃。
+    const status = Number.isInteger(frame.status) && frame.status >= 400 && frame.status < 500 ? frame.status : 502;
+    stream.res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
+    stream.res.end(JSON.stringify({ error: frame.code ?? 'relay/error', message: frame.message ?? '' }));
+    streams.delete(frame.streamId);
+    return;
+  }
+  if (kind === 'ws-data' || kind === 'ws-close') {
+    const stream = streams.get(frame.streamId);
+    if (!stream?.phone) return;
+    if (kind === 'ws-data') {
+      const payload = Buffer.from(frame.data ?? '', 'base64url');
+      noteFrame(payload.length);
+      metrics.bytesRelayed += payload.length;
+      if (stream.phone.readyState !== 1) {
+        recordDrop('downlink_phone_not_open', { streamId: frame.streamId, readyState: stream.phone.readyState, size: payload.length });
+        return;
+      }
+      // ★ 下行流控：手机消费慢时 ws 内部会排队，无上限则内存膨胀。
+      //   超过上限即关闭该桥（让客户端重连并靠 session 游标追平，而不是无限积压）。
+      //   ⚠ 但这正是 revision 跳号的触发场景之一：断桥 → 客户端重连 → resume。
+      //     P0 先让它可数可见；是否改语义（换关闭码 / 让客户端重取 snapshot）等数据说话。
+      if (stream.phone.bufferedAmount > MAX_PHONE_BUFFER_BYTES) {
+        recordDrop('downlink_backpressure', {
+          streamId: frame.streamId,
+          bufferedAmount: stream.phone.bufferedAmount,
+          limit: MAX_PHONE_BUFFER_BYTES,
+          size: payload.length
+        });
+        try { stream.phone.close(1013, 'downlink backpressure'); } catch { /* ignore */ }
+        streams.delete(frame.streamId);
+        return;
+      }
+      stream.phone.send(payload, { binary: frame.opcode !== 1, fin: frame.fin !== false });
+      return;
+    }
+    if (stream.phone.readyState === 1) stream.phone.close(frame.code ?? 1000, 'connector closed');
+    streams.delete(frame.streamId);
+    return;
+  }
+  if (kind === 'pair-result' || kind === 'pair-challenge' || kind === 'auth-challenge' || kind === 'auth-result') {
+    const key = kind === 'pair-result' ? `pair:${frame.channel}` : `ch:${frame.channel}`;
+    const stream = streams.get(key);
+    if (stream?.phone) send(stream.phone, frame);
+    return;
+  }
+  if (kind === 'devices') {
+    // 连接器上报已配对设备：更新路由表（覆盖式，撤销的设备自然消失）。
+    const ids = Array.isArray(frame.deviceIds) ? frame.deviceIds : [];
+    const connectorId = connectorIdOf(connectorWs);
+    if (connectorId) {
+      // 清理该连接器下已不再上报的设备
+      for (const [deviceId, entry] of [...devices]) {
+        if (entry.connectorId === connectorId && !ids.includes(deviceId) && entry.phones.size === 0) {
+          devices.delete(deviceId);
+        }
+      }
+      for (const deviceId of ids) {
+        if (typeof deviceId !== 'string' || deviceId.length === 0) continue;
+        const existing = devices.get(deviceId);
+        if (existing) existing.connectorId = connectorId;
+        else devices.set(deviceId, { connectorId, phones: new Set() });
+      }
+      console.log(`[ra-relay] 设备路由表更新：connector=${connectorId.slice(0, 8)} devices=${ids.length}`);
+    }
+    return;
+  }
+  if (kind === 'kick') {
+    const entry = devices.get(frame.deviceId);
+    if (entry) {
+      for (const phone of entry.phones) {
+        if (phone.readyState === 1) phone.close(4403, 'device revoked');
+      }
+      devices.delete(frame.deviceId);
+    }
+    return;
+  }
+  // hello / ping / pong / 未知帧：中继不裁定协议，静默计数。
+}
+
+function onPhoneSocket(ws, url, req) {
+  metrics.phoneConnects += 1;
+  const connectorId = url.searchParams.get('c');
+  const routed = connectorFor(req, url) ?? (connectorId && connectors.has(connectorId) ? { ws: connectors.get(connectorId), deviceId: 'pair' } : null);
+  if (!routed?.ws) {
+    ws.close(4503, 'connector offline');
+    return;
+  }
+  const claimedDeviceId = url.searchParams.get('d') ?? routeHintFromCookie(req.headers.cookie) ?? `pair-${randomUUID().slice(0, 8)}`;
+  const channel = url.searchParams.get('ch');
+  const connector = routed.ws;
+  let entry = devices.get(claimedDeviceId);
+  if (!entry || entry.connectorId !== connectorId) {
+    // 新设备或换连接器（换机/重连到另一实例）：重建登记。
+    entry = { connectorId, phones: new Set() };
+    devices.set(claimedDeviceId, entry);
+  }
+  if (entry.phones.size >= MAX_PHONE_PER_DEVICE) {
+    ws.close(4429, 'too many connections');
+    return;
+  }
+  entry.phones.add(ws);
+
+  // 信令通道（/device?ch=）：pair/auth 帧按 channel 回路。
+  if (url.pathname === '/device' && channel) {
+    streams.set(`ch:${channel}`, { phone: ws });
+    streams.set(`pair:${channel}`, { phone: ws });
+  }
+
+  // PWA WS 桥：升级即开桥（手机 101 已完成；数据泵开始）。
+  if (url.pathname !== '/device') {
+    const streamId = randomUUID();
+    metrics.wsBridges += 1;
+    streams.set(streamId, { phone: ws });
+    send(connector, {
+      kind: 'ws-open',
+      deviceId: claimedDeviceId,
+      streamId,
+      path: req.url ?? '/',
+      headers: { cookie: typeof req.headers.cookie === 'string' ? req.headers.cookie : '' }
+    });
+    ws.on('error', (error) => {
+      recordDrop('ws_error', {
+        peer: 'phone',
+        code: error?.code ?? null,
+        message: String(error?.message ?? error).slice(0, 200)
+      });
+    });
+    ws.on('message', (data, isBinary) => {
+      noteFrame(data.length);
+      // ★ 这里以前也是静默 return —— 手机上行超过 512KB 就无声消失（P0 补上出处）。
+      if (data.length > 512 * 1024) {
+        recordDrop('uplink_frame_too_large', { dir: 'phone', size: data.length, limit: 512 * 1024, streamId });
+        return;
+      }
+      // ★ 上行帧必须检查发送结果：失败即关桥（客户端重连后用游标追平），
+      //   绝不静默丢弃 —— 丢一帧就会让 assistant-stream 的 revision 断档。
+      const okSent = send(connector, {
+        kind: 'ws-data',
+        deviceId: claimedDeviceId,
+        streamId,
+        fin: true,
+        opcode: isBinary ? 2 : 1,
+        data: Buffer.from(data).toString('base64url')
+      });
+      if (!okSent) {
+        // send() 内部已 recordDrop（socket_not_open / outbound_frame_too_large / socket_buffer_full），
+        // 这里只负责断桥决策。
+        try { ws.close(1013, 'uplink backpressure'); } catch { /* ignore */ }
+        streams.delete(streamId);
+      }
+    });
+    ws.on('close', (code, reason) => {
+      recordClose('phone', code, reason);
+      send(connector, { kind: 'ws-close', deviceId: claimedDeviceId, streamId, code: 1000 });
+      streams.delete(streamId);
+    });
+  }
+
+  ws.on('message', (data, isBinary) => {
+    // /device 信令帧：opaque 直通（pair-begin/auth-begin/sealed 等）。
+    if (url.pathname !== '/device') return; // 非信令路径由上面那条 handler 处理，不是丢帧
+    if (isBinary) return recordDrop('device_binary_frame', { size: data.length, channel });
+    noteFrame(data.length);
+    if (data.length > MAX_FRAME_BYTES) {
+      return recordDrop('device_frame_too_large', { size: data.length, limit: MAX_FRAME_BYTES, channel });
+    }
+    let frame;
+    try {
+      frame = JSON.parse(data.toString('utf8'));
+    } catch {
+      return recordDrop('bad_json', { dir: 'phone-device', size: data.length, channel });
+    }
+    if (!frame || typeof frame !== 'object') return;
+    frame.deviceId = frame.deviceId ?? claimedDeviceId;
+    send(connector, frame);
+  });
+  ws.on('close', (code, reason) => {
+    recordClose('phone', code, reason);
+    entry.phones.delete(ws);
+    if (entry.phones.size === 0 && devices.get(claimedDeviceId) === entry) devices.delete(claimedDeviceId);
+    if (channel) {
+      streams.delete(`ch:${channel}`);
+      streams.delete(`pair:${channel}`);
+    }
+  });
+}
+
+// ---- 装配 ----
+
+const handler = (req, res) => handlePhoneHttp(req, res);
+const server = process.env.TLS_KEY && process.env.TLS_CERT
+  ? https.createServer({ key: readFileSync(process.env.TLS_KEY), cert: readFileSync(process.env.TLS_CERT) }, handler)
+  : http.createServer(handler);
+server.on('upgrade', handleUpgrade);
+// HOST 环境变量可限定绑定面（本机自测建议 127.0.0.1，避免把 dev 模式中继暴露到局域网）。
+const HOST = process.env.HOST || undefined;
+server.listen(PORT, HOST, () => {
+  const proto = process.env.TLS_KEY ? 'wss/https' : 'ws/http（开发模式，生产必须配 TLS）';
+  const bound = server.address()?.port ?? PORT;
+  console.log(`[ra-relay] listening on ${HOST ?? '0.0.0.0'}:${bound} (${proto}); tokens=${RELAY_TOKENS.size ? 'configured' : 'OPEN — 仅限本地开发'}`);
+});

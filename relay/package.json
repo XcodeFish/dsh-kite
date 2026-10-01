@@ -1,0 +1,17 @@
+{
+  "name": "dsh-kite-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "dsh-kite 的公网中继：只做配对转发 + 限流，不做信任判断，不持久化消息。部署见 README.md。",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  }
+}

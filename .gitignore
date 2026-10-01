@@ -1,0 +1,10 @@
+node_modules/
+*.log
+.DS_Store
+relay/.local-token
+# cloudflared 二进制（38MB，按需下载，不入库）
+relay/bin/
+# 部署包产物（由 relay/deploy/build-bundle.sh 现场生成）
+relay/deploy/dist/
+# 打包产物（pack.sh 输出）
+dist/
