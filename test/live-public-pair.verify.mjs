@@ -205,26 +205,61 @@ if (challenge && globalThis.__liveKeys) {
 }
 
 // ---- ⑤ 进入 DSH：带设备 cookie 摸 /（手机点「进入 DSH」后做的事）----
+//   ★ 只测 `/` 是不够的 —— 这正是本脚本漏报白屏的原因（2026-10-02 真机事故）。
+//     手机拿到主文档后，浏览器会**紧接着**去取它引用的 JS/CSS。这些资源 URL 是
+//     相对路径 `./assets/...`，**不带 c 参数**，只能靠 ra-device cookie 路由。
+//     若该 deviceId 不在中继路由表里，资源全部 401 → 主文档到了但应用起不来 →
+//     **白屏**。而 `/?c=<connectorId>` 因为带 c 永远是 200，所以只看首页会假绿。
+//     因此这里必须：① 不带 c 请求 `/`（纯 cookie 路由）；② 真去取资源并断言可加载。
+let assetsOk = false;
 if (deviceCookie) {
   try {
-    const home = await relayFetch(`/?c=${CONNECTOR_ID}`, { headers: { cookie: deviceCookie } });
+    const home = await relayFetch(`/`, { headers: { cookie: deviceCookie } });
     const body = await home.text();
     const isPairHint = body.includes('需要配对') || body.includes('还没有接入');
-    check('⑤ 带设备 cookie 进入 DSH', home.status === 200 && !isPairHint,
-      `HTTP ${home.status}${isPairHint ? ' · 落到配对提示页 ✗' : ' · 已进入 DSH ✓'}`);
+    check('⑤ 不带 c 进入 DSH（纯 cookie 路由）', home.status === 200 && !isPairHint,
+      `HTTP ${home.status}${isPairHint ? ' · 落到配对提示页 ✗（该 deviceId 不在中继路由表）' : ' · 已进入 DSH ✓'}`);
+
+    if (home.status === 200 && !isPairHint) {
+      // 抽出主文档引用的本地资源（跳过 plugins/ 合并包：那是十几 MB 的重请求，
+      // 单独由 ws-mux / 手工验收覆盖，这里只验「首屏渲染必需的 JS/CSS/SVG」）。
+      const refs = [...body.matchAll(/(?:src|href)="(\.\/[^"]+)"/g)]
+        .map((m) => m[1].replace(/^\.\//, '/'))
+        .filter((p) => !p.startsWith('/plugins/'))
+        .slice(0, 8);
+      const results = [];
+      for (const path of refs) {
+        try {
+          // ★ 不带 c：与浏览器行为一致，走 cookie 路由。
+          const res = await relayFetch(path, { headers: { cookie: deviceCookie } });
+          const len = (await res.arrayBuffer()).byteLength;
+          results.push({ path, status: res.status, len });
+        } catch (error) {
+          results.push({ path, status: 0, err: error.message });
+        }
+      }
+      const bad = results.filter((r) => r.status !== 200 || r.len === 0);
+      assetsOk = refs.length > 0 && bad.length === 0;
+      check('⑥ 首屏资源可加载（不带 c，纯 cookie 路由）', assetsOk,
+        refs.length === 0
+          ? '主文档未引用本地资源（结构变了？请检查选择器）'
+          : assetsOk
+            ? `${refs.length} 个资源全部 200`
+            : `${bad.length}/${refs.length} 失败：${bad.map((b) => `${b.path}→${b.status || b.err}`).join(', ')}`);
+    }
   } catch (error) {
-    check('⑤ 带设备 cookie 进入 DSH', false, error.message);
+    check('⑤ 不带 c 进入 DSH（纯 cookie 路由）', false, error.message);
   }
 } else {
-  check('⑤ 带设备 cookie 进入 DSH', false, '无设备 cookie');
+  check('⑤ 不带 c 进入 DSH（纯 cookie 路由）', false, '无设备 cookie');
 }
 
-// ---- ⑥ 中继上该连接器在线 ----
+// ---- ⑦ 中继上该连接器在线 ----
 try {
   const health = await (await relayFetch('/healthz')).json();
-  check('⑥ 中继报告连接器在线', health.connectors >= 1, `connectors=${health.connectors}`);
+  check('⑦ 中继报告连接器在线', health.connectors >= 1, `connectors=${health.connectors}`);
 } catch (error) {
-  check('⑥ 中继报告连接器在线', false, error.message);
+  check('⑦ 中继报告连接器在线', false, error.message);
 }
 
 // ---- 清理：吊销本次验证设备，避免污染设备表 ----
