@@ -318,6 +318,7 @@ export function apply(ctx, config) {
       },
       audit,
       fingerprint: keys.fingerprint,
+      keys,
       relayStatus: () => live.relay.status(),
       kickDevice: (deviceId) => live.relay.kickDevice(deviceId),
       relayPublicUrl: () => cfg.relayPublicUrl || null,
