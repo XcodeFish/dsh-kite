@@ -34,7 +34,15 @@ COPYFILE_DISABLE=1 tar --no-xattrs -czf "$out_dir/ra-relay.tar.gz" -C "$stage" r
 
 echo "打包完成：$out_dir/ra-relay.tar.gz"
 ls -lh "$out_dir/ra-relay.tar.gz"
+# ★ 打出可核对的指纹：server.mjs 决定服务器行为，tarball 还要受 README/install.sh 影响。
+#   没有这两个数，就无法判断「VPS 上跑的到底是哪一版」—— 2026-10-02 真机事故：
+#   修复提交在仓库里，但上传的是**另一个克隆**里 21:28 的旧包，行为毫无变化却以为已修复。
+echo "  server.mjs sha256 : $(shasum -a 256 "$relay_dir/server.mjs" | cut -d' ' -f1)"
+echo "  tarball    sha256 : $(shasum -a 256 "$out_dir/ra-relay.tar.gz" | cut -d' ' -f1)"
 echo
 echo "下一步（两条命令）："
 echo "  scp $out_dir/ra-relay.tar.gz user@<VPS_IP>:/tmp/"
-echo "  ssh user@<VPS_IP> 'tar xzf /tmp/ra-relay.tar.gz -C /tmp && sudo /tmp/ra-relay/install.sh'"
+echo "  ssh user@<VPS_IP> 'tar xzf /tmp/ra-relay.tar.gz -C /tmp && sudo PUBLIC_IP=<VPS_IP> /tmp/ra-relay/install.sh'"
+echo
+echo "★ 注意：dist/ 不入库，每个克隆各打各的包。上传前先确认你 scp 的就是刚打出来的这一个："
+echo "    shasum -a 256 $out_dir/ra-relay.tar.gz"
