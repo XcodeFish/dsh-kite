@@ -683,18 +683,29 @@ function relayConnectorFrame(connectorWs, frame) {
 
 function onPhoneSocket(ws, url, req) {
   metrics.phoneConnects += 1;
-  const connectorId = url.searchParams.get('c');
-  const routed = connectorFor(req, url) ?? (connectorId && connectors.has(connectorId) ? { ws: connectors.get(connectorId), deviceId: 'pair' } : null);
+  const cParam = url.searchParams.get('c');
+  const routed = connectorFor(req, url) ?? (cParam && connectors.has(cParam) ? { ws: connectors.get(cParam), deviceId: 'pair' } : null);
   if (!routed?.ws) {
     ws.close(4503, 'connector offline');
     return;
   }
+  // ★ 真实 connectorId 只能从**已解析出的 socket** 反查，不能取 URL 的 c 参数。
+  //   真机事故 2026-10-02：浏览器建 WS 用相对路径 `/api/remote.mux`（**不带 c**），
+  //   于是 `url.searchParams.get('c')` 为 null；而下面第 696 行拿它跟
+  //   `entry.connectorId`（真实指纹）比较，`"0cb0526a…" !== null` 恒真 →
+  //   每次手机建 WS 都被判成「换连接器了」→ 重建 entry 并**覆盖掉该设备原有登记**。
+  //   后果是自我破坏的：手机一连实时通道，自己就被挤出路由表，随后所有不带 c 的
+  //   请求（首页 + 全部 assets）全 401 → 界面能开但**数据不再实时同步**；
+  //   且下次刷新又白屏。因果已实测：WS 前 HTTP 200 ✓ → 建一次 WS → WS 后 HTTP 401 ✗。
+  const connectorId = connectorIdOf(routed.ws) ?? cParam;
   const claimedDeviceId = url.searchParams.get('d') ?? routeHintFromCookie(req.headers.cookie) ?? `pair-${randomUUID().slice(0, 8)}`;
   const channel = url.searchParams.get('ch');
   const connector = routed.ws;
   let entry = devices.get(claimedDeviceId);
   if (!entry || entry.connectorId !== connectorId) {
     // 新设备或换连接器（换机/重连到另一实例）：重建登记。
+    //   connectorId 修正后，同一设备+同一连接器的重复连接会走「entry 保留」分支，
+    //   不再覆盖登记，也就不会丢掉 entry.phones（kick/断线时要逐个 close 的通道集合）。
     entry = { connectorId, phones: new Set() };
     devices.set(claimedDeviceId, entry);
   }

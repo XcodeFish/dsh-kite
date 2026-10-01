@@ -352,3 +352,77 @@ test('中继：无法路由的 ra-device 必须立刻应答，不得静默吞掉
     relay?.kill();
   }
 }, { timeout: 20000 });
+
+test('中继：手机建 WS（URL 不带 c）不得把设备挤出路由表（2026-10-02 实时同步丢失回归）', async (t) => {
+  // 真机事故：手机界面能打开，但**数据不再实时同步**，且下次刷新又白屏。
+  //
+  // 根因：onPhoneSocket 里 `const connectorId = url.searchParams.get('c')`。
+  //   浏览器建 WS 用相对路径 `/api/remote.mux`，URL 里**没有 c** → connectorId = null；
+  //   紧接着 `if (!entry || entry.connectorId !== connectorId)` 拿它跟真实指纹比较，
+  //   `"<指纹>" !== null` 恒为真 → 每次都判定「换连接器」→ 重建 entry，
+  //   覆盖掉 devices 里该 deviceId 的登记（并丢弃 phones 集合）。
+  //   设备随即从路由表消失 → 之后所有不带 c 的请求（首页 + 全部 assets）全 401。
+  //   因果实测：WS 前 HTTP 200 ✓ → 建一次 WS → WS 后 HTTP 401 ✗。
+  let relay;
+  let connectorA;
+  let connectorB;
+  try {
+    relay = await startRelay();
+    t.after(() => {
+      connectorA?.close();
+      connectorB?.close();
+      relay?.kill();
+    });
+    // ★ 必须**两个**连接器才能暴露此 bug。单连接器时 connectorFor 会走
+    //   「单连接器兜底」把请求投给唯一在线者，从而掩盖 entry.connectorId 已被写成
+    //   null 的损坏 —— 本测试首版正是因此假绿（旧代码也 5/5 全过）。线上是 2 个，
+    //   兜底不生效，损坏才会显形。
+    connectorA = await connectConnector('ws-route-a');
+    connectorB = await connectConnector('ws-route-b');
+    const frames = collectFrames(connectorA);
+
+    // ① 连接器 A 上报设备表 → 该设备应被 cookie 路由到 A
+    //    cookie 必须是 `v1.<b64url(payload)>.<sig>` 三段式：routeHintFromCookie 对格式
+    //    有校验，格式不对会直接返回 null，测不到目标分支。
+    const deviceId = 'phone-ws-test';
+    const payload = Buffer.from(JSON.stringify({ deviceId, v: 1 })).toString('base64url');
+    const cookie = `ra-device=v1.${payload}.x`;
+    connectorA.send(JSON.stringify({ kind: 'devices', deviceIds: [deviceId] }));
+    await new Promise((r) => setTimeout(r, 150));
+
+    // ② 建一条手机 WS（**不带 c**，与浏览器一致）。中继会向连接器发 ws-open。
+    const phone = new WebSocket(`ws://127.0.0.1:${resolvedPort}/api/remote.mux`, { headers: { cookie } });
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('phone ws open timeout')), 5000);
+      phone.onopen = () => { clearTimeout(timer); resolve(); };
+      phone.onerror = () => { clearTimeout(timer); reject(new Error('phone ws error')); };
+    });
+    await new Promise((r) => setTimeout(r, 200));
+
+    // ③ ★ 核心断言：建完 WS 后，该 deviceId 必须**仍在**路由表里。
+    //    旧实现会因 connectorId=null 覆盖登记；修复后登记保持。
+    //
+    //    ★ 不要等 HTTP 响应完整回来：中继把请求转发给连接器后会**一直等它回答**，
+    //      而这里没人回 → 断言会挂在 110s 看门狗上（首版就栽在这，跑了 110 秒）。
+    //      改为断言「中继是否向连接器发出了 http-head」—— 这正是「路由成功」的定义，
+    //      且不含等待连接器回包的时序。
+    const replyPromise = fetch(`http://127.0.0.1:${resolvedPort}/some-path`, { headers: { cookie } });
+    replyPromise.catch(() => {}); // 失败路径不产生 unhandled rejection
+    const head = await frames.waitFor(
+      (f) => f.kind === 'http-head' && f.path === '/some-path',
+      'http-head after ws'
+    );
+    assert.equal(head.deviceId, deviceId, '应带着该 deviceId 路由（而不是兜底的 pair）');
+
+    phone.close();
+    // 主动收尾：给连接器回一个响应，让上面那个 fetch 正常结束（不必等看门狗）。
+    connectorA.send(JSON.stringify({ kind: 'http-res-head', deviceId: head.deviceId, streamId: head.streamId, status: 200, headers: { 'content-type': 'text/plain' } }));
+    connectorA.send(JSON.stringify({ kind: 'http-res-body', deviceId: head.deviceId, streamId: head.streamId, chunk: Buffer.from('ok').toString('base64url'), final: true }));
+    const res = await replyPromise;
+    assert.equal(res.status, 200);
+  } finally {
+    connectorA?.close();
+    connectorB?.close();
+    relay?.kill();
+  }
+}, { timeout: 20000 });
