@@ -143,6 +143,123 @@
       statusNote.style.marginTop = '7px';
       statusCard.appendChild(statusNote);
 
+      // ---- 中继接入（可视化配置；交互稿 §2，令牌永不回显，探针用临时 connectorId）----
+      var relayHead = h('div', H2, '中继接入（可视化配置）');
+      var relayCard = h('div', CARD);
+      var rcStateRow = h('div', 'display:flex;align-items:center;gap:10px;flex-wrap:wrap;');
+      var rcBadgeEl = h('span', 'padding:2px 9px;border-radius:99px;font:11px/1.6 system-ui,sans-serif;background:#2a303a;color:#9aa4b2;', '未知');
+      var rcEffective = h('span', MONO, '（未配置）');
+      rcStateRow.appendChild(rcBadgeEl);
+      rcStateRow.appendChild(rcEffective);
+      function rcInput(placeholder) { var i = document.createElement('input'); i.placeholder = placeholder; return i; }
+      var rcUrl = rcInput('wss://中继地址:端口');
+      var rcToken = rcInput('令牌（留空 = 沿用当前）');
+      rcToken.type = 'password';
+      var rcPublic = rcInput('公网入口（默认从地址派生 https）');
+      var rcForm = h('div', 'display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;');
+      [rcUrl, rcToken, rcPublic].forEach(function (el) { el.style.flex = '1'; el.style.minWidth = '12rem'; rcForm.appendChild(el); });
+      var rcMsg = h('span', NOTE, '');
+      var rcConfirm = h('div', 'display:none;border:1px solid #d29922;border-radius:8px;padding:10px 12px;margin-top:10px;background:#241a05;');
+      var rcSummary = h('div', NOTE, '');
+      var rcReWarn = h('div', 'color:#f85149;font-size:12px;line-height:1.6;display:none;margin-top:4px;', '⚠ 改公网入口 = 所有已配对手机都要重新扫码（设备私钥按 origin 隔离，新 origin 里没有它）。');
+      var rcConfirmRow = h('div', 'display:flex;gap:8px;margin-top:8px;');
+      var rcCurrent = h('div', NOTE, '');
+      rcCurrent.style.marginTop = '10px';
+      var rcData = null;
+      var rcProbeBtn = btn('测试连接', BTN, function () { rcProbe(); });
+      var rcApplyBtn = btn('应用并重连', BTN_PRIMARY, function () { rcArm(); });
+      var rcYesBtn = btn('确认写入并重连', BTN_PRIMARY, function () { rcApply(); });
+      var rcNoBtn = btn('取消', BTN, function () { rcDisarm(); });
+      var rcBtns = h('div', 'display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap;');
+      rcBtns.appendChild(rcProbeBtn); rcBtns.appendChild(rcApplyBtn); rcBtns.appendChild(rcMsg);
+      rcConfirmRow.appendChild(rcYesBtn); rcConfirmRow.appendChild(rcNoBtn);
+      rcConfirm.appendChild(rcSummary); rcConfirm.appendChild(rcReWarn); rcConfirm.appendChild(rcConfirmRow);
+      relayCard.appendChild(rcStateRow);
+      relayCard.appendChild(rcForm);
+      relayCard.appendChild(rcBtns);
+      relayCard.appendChild(rcConfirm);
+      relayCard.appendChild(rcCurrent);
+      rcUrl.oninput = function () {
+        var v = rcUrl.value.trim();
+        // ws:// 仅回环放行（本机联调）；远程明文入口在输入阶段就拦下。
+        if (/^ws:\/\//i.test(v) && !/^ws:\/\/(127\.0\.0\.1|localhost|\[::1\])/i.test(v)) rcMsg.textContent = '✗ 远程地址只允许 wss://（本机联调可用 ws://127.0.0.1）';
+        else rcMsg.textContent = '';
+      };
+      var RC_HINT = {
+        format: '地址格式不对：只接受 wss:// 开头。',
+        dns: '域名解析失败：核对地址拼写，或服务器已下线。',
+        tls: 'TLS/证书异常：证书过期或不被信任（裸 IP 证书 7 天短期档，Caddy 会自动续）。',
+        timeout: '超时：服务未运行或云防火墙未放行端口（丢包表现为持续超时，秒回拒绝才是服务没起）。',
+        server: '中继异常：查看 /healthz 与日志；确认部署的是新版中继（/metrics 含 wire_frame_limit 行）。',
+        auth: '令牌被拒：与中继 RELAY_TOKENS 不一致，或当前未配置令牌。'
+      };
+      function rcSetMsg(text, bad) { rcMsg.textContent = text; rcMsg.style.color = bad ? '#f85149' : '#8b949e'; }
+      function rcInputUrl() { return rcUrl.value.trim() || (rcData && rcData.effective.relayUrl) || ''; }
+      function rcProbe() {
+        rcSetMsg('探测中…（临时 connectorId，不影响在线连接）', false);
+        rcProbeBtn.disabled = true;
+        api('/relay/probe', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ relayUrl: rcInputUrl(), relayToken: rcToken.value.trim(), relayPublicUrl: rcPublic.value.trim() }) })
+          .then(function (r) {
+            if (r.ok) rcSetMsg('✓ 探针通过（' + (r.latencyMs || 0) + 'ms）· 可以「应用并重连」', false);
+            else rcSetMsg('✗ ' + (RC_HINT[r.code] || '') + (r.reason ? '（' + r.reason + '）' : ''), true);
+          })
+          .catch(function (e) { rcSetMsg('探针失败：' + e.message, true); })
+          .then(function () { rcProbeBtn.disabled = false; });
+      }
+      function rcArm() {
+        var url = rcInputUrl().trim();
+        if (!/^wss:\/\//i.test(url) && !/^ws:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/i.test(url)) { rcSetMsg('✗ 远程地址只允许 wss://（本机联调可用 ws://127.0.0.1）', true); return; }
+        var pub = rcPublic.value.trim() || url.replace(/^wss/i, 'https');
+        var changed = rcData && rcData.effective.relayPublicUrl && rcData.effective.relayPublicUrl !== pub;
+        var newlySet = rcData && !rcData.effective.relayPublicUrl;
+        rcSummary.textContent = '将写入并生效：地址 ' + url + ' ｜ 公网入口 ' + pub + ' ｜ 令牌 ' + (rcToken.value.trim() ? '更新为新值' : '沿用当前');
+        rcReWarn.style.display = (changed || newlySet) ? 'block' : 'none';
+        rcConfirm.style.display = 'block';
+        rcApplyBtn.disabled = true;
+      }
+      function rcDisarm() { rcConfirm.style.display = 'none'; rcApplyBtn.disabled = false; }
+      function rcApply() {
+        rcYesBtn.disabled = true;
+        rcSetMsg('写入并重连中…', false);
+        api('/relay', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ relayUrl: rcInputUrl().trim(), relayToken: rcToken.value.trim(), relayPublicUrl: rcPublic.value.trim() }) })
+          .then(function (r) {
+            if (r.ok) {
+              rcSetMsg('✓ 已写入 relay-override.json 并重连（来源：面板覆盖；删该文件即回退）', false);
+              rcToken.value = '';
+              rcDisarm();
+              load(true);
+            } else if (r.stage === 'killed') {
+              rcSetMsg('✗ ' + r.reason, true);
+              rcDisarm();
+            } else {
+              var prefix = r.stage === 'probe' ? '探针未通过' : (r.stage === 'write' ? '写入失败' : '校验未通过');
+              rcSetMsg('✗ ' + prefix + '：' + (r.code ? (RC_HINT[r.code] || '') + ' ' : '') + (r.reason || ''), true);
+              if (r.stage !== 'validate') rcDisarm();
+            }
+          })
+          .catch(function (e) { rcSetMsg('请求失败：' + e.message, true); })
+          .then(function () { rcYesBtn.disabled = false; });
+      }
+      function rcRender() {
+        if (!rcData) return;
+        var map = { open: ['已连接', '#123527', '#7ee2b8'], connecting: ['连接中', '#2a303a', '#9aa4b2'], retrying: ['重试中', '#3a2c12', '#e3b341'], standby: ['待机', '#2a303a', '#9aa4b2'], killed: ['已紧急停用', '#3a1518', '#f85149'] };
+        var m = map[rcData.relay && rcData.relay.state] || ['未知', '#2a303a', '#9aa4b2'];
+        rcBadgeEl.textContent = m[0]; rcBadgeEl.style.background = m[1]; rcBadgeEl.style.color = m[2];
+        rcEffective.textContent = (rcData.effective.relayUrl || '（未配置）') + (rcData.relay && rcData.relay.lastError ? ' · ' + rcData.relay.lastError : '');
+        var srcMap = { env: 'env（优先级最高，面板改动不生效）', override: '面板覆盖', patch: 'cordis.patch.yml', derived: '自动派生', default: '默认' };
+        var s = rcData.sources || {};
+        var tokenText = rcData.effective.relayTokenSet ? '已设置（指纹 ' + rcData.effective.relayTokenFp + '）' : '未设置';
+        rcCurrent.textContent = '生效来源：地址=' + (srcMap[s.relayUrl] || s.relayUrl) + ' · 令牌=' + (srcMap[s.relayToken] || s.relayToken) + ' · 入口=' + (srcMap[s.relayPublicUrl] || s.relayPublicUrl)
+          + '　|　令牌 ' + tokenText + '　|　覆盖文件 ' + (rcData.override && rcData.override.exists ? '存在（' + new Date(rcData.override.changedAt).toLocaleString() + ' 写入）' : '无');
+        var killed = rcData.killswitch && rcData.killswitch.enabled;
+        rcApplyBtn.disabled = Boolean(killed);
+        rcApplyBtn.title = killed ? 'kill switch 生效中：先解除紧急停用' : '';
+        if (killed) rcSetMsg('kill switch 生效中：解除后才可应用新配置', true);
+      }
+      function rcLoad() {
+        return api('/relay').then(function (d) { rcData = d; rcRender(); }).catch(function (e) { rcSetMsg('配置读取失败：' + e.message, true); });
+      }
+
       // 配对区
       var pairHead = h('div', H2, '添加设备（扫码连接）');
       var pairCard = h('div', CARD);
@@ -226,6 +343,8 @@
       auditCard.appendChild(auditPre);
 
       body.appendChild(statusCard);
+      body.appendChild(relayHead);
+      body.appendChild(relayCard);
       body.appendChild(pairHead);
       body.appendChild(pairCard);
       body.appendChild(devHead);
@@ -311,6 +430,7 @@
       }
 
       function load(isManual) {
+        rcLoad();
         return api('/status').then(function (s) {
           pending = s;
           renderStatus(s);

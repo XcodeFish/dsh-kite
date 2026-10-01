@@ -20,6 +20,7 @@
 import { promises as fsp } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { createHash } from 'node:crypto';
 
 import { hostAdapter } from './host-adapter.js';
 import { loadConnectorKeys } from './identity/keys.js';
@@ -29,16 +30,16 @@ import { createPairingService } from './identity/pairing.js';
 import { createPolicy } from './policy/methods.js';
 import { AuditLog } from './policy/audit.js';
 import { LoopbackCredential } from './proxy/loopback-credential.js';
-import { RelayConnector } from './transport/relay-client.js';
+import { RelayConnector, probeRelay } from './transport/relay-client.js';
 import { acquireRelayOwnerLock } from './transport/owner-lock.js';
 import { registerApprovalAudit } from './approvals/responders.js';
-import { createAdminHandler, createPairPageHandler, KillSwitch } from './admin/panel.js';
+import { createAdminHandler, createPairPageHandler, KillSwitch, RelayOverrideStore } from './admin/panel.js';
 import { menuEntryRows } from './admin/menu-entry.js';
 
 export const name = 'kite';
 export const inject = ['webServer'];
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 
 /** 数据目录：$DSH_HOME/plugin-data/dsh-kite/<profile>/（宿主进程没有 DSH_PROFILE → default）。 */
 export function defaultDataDir(config) {
@@ -78,18 +79,34 @@ export async function migrateLegacyDataDir(dataDir, config, logger) {
   return true;
 }
 
-/** 配置规范化（config 来自 cordis.patch.yml；env 可覆盖，便于不动 patch 调试）。 */
-export function readConfig(config) {
+/** 配置规范化（config 来自 cordis.patch.yml）。四级优先级（HANDOVER §5.3）：
+ *  env (DSH_KITE_RELAY_URL/_TOKEN) > relay-override.json（面板写入）> patch > 默认值。
+ *  面板覆盖排在 patch 之上：插件数据目录是插件唯一完全拥有的配置面（§5.1）。
+ *  返回 __sources 供面板显示每个字段的实际生效来源。 */
+export function readConfig(config, override) {
   const cfg = config && typeof config === 'object' ? config : {};
   const num = (value, fallback, min, max) => {
     const n = Number(value);
     return Number.isFinite(n) ? Math.min(max ?? Infinity, Math.max(min ?? -Infinity, n)) : fallback;
   };
-  const relayUrl = String(process.env.DSH_KITE_RELAY_URL ?? cfg.relayUrl ?? '').trim();
+  const ov = override && typeof override === 'object' ? override : null;
+  const pick = (key, envName) => {
+    const env = envName ? process.env[envName] : undefined;
+    if (typeof env === 'string' && env.trim() !== '') return { value: env.trim(), source: 'env' };
+    const o = ov ? ov[key] : undefined;
+    if (typeof o === 'string' && o.trim() !== '') return { value: o.trim(), source: 'override' };
+    const p = cfg[key];
+    if (typeof p === 'string' && p.trim() !== '') return { value: p.trim(), source: 'patch' };
+    return { value: '', source: 'default' };
+  };
+  const urlPick = pick('relayUrl', 'DSH_KITE_RELAY_URL');
+  const relayUrl = /^wss?:\/\//.test(urlPick.value) ? urlPick.value.replace(/\/+$/, '') : '';
+  const tokenPick = pick('relayToken', 'DSH_KITE_RELAY_TOKEN');
+  const publicPick = pick('relayPublicUrl', null);
   return {
-    relayUrl: /^wss?:\/\//.test(relayUrl) ? relayUrl.replace(/\/+$/, '') : '',
-    relayToken: String(process.env.DSH_KITE_RELAY_TOKEN ?? cfg.relayToken ?? ''),
-    relayPublicUrl: String(cfg.relayPublicUrl ?? '').trim() || (relayUrl ? relayUrl.replace(/^ws/, 'http').replace(/\/+$/, '') : ''),
+    relayUrl,
+    relayToken: tokenPick.value,
+    relayPublicUrl: publicPick.value || (relayUrl ? relayUrl.replace(/^ws/, 'http') : ''),
     remoteAgentPreset: String(cfg.remoteAgentPreset ?? 'default'),
     allowedAgentPresets: Array.isArray(cfg.allowedAgentPresets) ? cfg.allowedAgentPresets.map(String) : ['default'],
     allowTerminal: cfg.allowTerminal === true,
@@ -97,7 +114,12 @@ export function readConfig(config) {
     menuEntry: cfg.menuEntry !== false,
     pairingTtlSeconds: num(cfg.pairingTtlSeconds, 120, 30, 3600),
     ticketTtlHours: num(cfg.ticketTtlHours, 12, 1, 24 * 30),
-    dataDir: cfg.dataDir
+    dataDir: cfg.dataDir,
+    __sources: {
+      relayUrl: relayUrl ? urlPick.source : 'default',
+      relayToken: tokenPick.value ? tokenPick.source : 'default',
+      relayPublicUrl: publicPick.value ? publicPick.source : (relayUrl ? 'derived' : 'default')
+    }
   };
 }
 
@@ -112,6 +134,7 @@ export function apply(ctx, config) {
   const dataDir = defaultDataDir(cfg);
   const audit = new AuditLog(dataDir, logger);
   const killSwitch = new KillSwitch(dataDir);
+  const relayOverride = new RelayOverrideStore(dataDir);
 
   // 立即挂管理面（未就绪时 API 返回 starting），避免面板路径与其它插件撞车窗口。
   let deps = null;
@@ -172,51 +195,138 @@ export function apply(ctx, config) {
     });
     await fsp.mkdir(dataDir, { recursive: true });
     const [keys] = await Promise.all([loadConnectorKeys(dataDir), killSwitch.load()]);
+    // 面板覆盖（relay-override.json）加载后同步进 cfg —— 原地修改同一个对象，
+    // 让 `() => cfg.relayPublicUrl` 这类 live getter 看到新值（§5.5 坑 3）。
+    const override = await relayOverride.load();
+    const effective = readConfig(config, override);
+    for (const field of ['relayUrl', 'relayToken', 'relayPublicUrl']) cfg[field] = effective[field];
+    cfg.__sources = effective.__sources;
     const devices = await new DeviceStore(dataDir, logger).load();
     keysRef = keys; // 入口令牌签名用（注入回调触发时读取）
     const tickets = createTicketService(keys, cfg.ticketTtlHours * 3600_000, logger);
-    const pairing = createPairingService({
-      keys,
-      tickets,
-      devices,
-      ttlMs: cfg.pairingTtlSeconds * 1000,
-      logger,
-      audit: (entry) => audit.append(entry),
-      // ws:// 中继（本地联调）不发 Secure cookie，否则 http 下浏览器会丢弃。
-      secureCookies: cfg.relayUrl.startsWith('wss://')
-    });
     const policy = createPolicy(cfg);
     const credential = new LoopbackCredential(adapter, logger);
-    const relay = new RelayConnector({
-      relayUrl: cfg.relayUrl,
-      relayToken: cfg.relayToken,
-      connectorId: keys.fingerprint,
-      devices,
-      tickets,
-      pairing,
-      policy,
-      credential,
-      keys,
-      audit: (entry) => audit.append(entry),
-      logger,
-      isKilled: () => killSwitch.enabled,
-      handlePairPage: (...args) => pairPage(...args) // 保留路径回调；pairPage 在下方声明，调用时已就绪
-    });
-    const pairPage = createPairPageHandler({ pairing, fingerprint: keys.fingerprint, tickets, devices, audit: (entry) => audit.append(entry) });
+
+    let live = null; // { pairing, pairPage, relay } —— 改配置时整体重建（§5.5 坑 2：secureCookies 捕获于创建时）
+    const buildLive = () => {
+      const pairing = createPairingService({
+        keys,
+        tickets,
+        devices,
+        ttlMs: cfg.pairingTtlSeconds * 1000,
+        logger,
+        audit: (entry) => audit.append(entry),
+        // ws:// 中继（本地联调）不发 Secure cookie，否则 http 下浏览器会丢弃。
+        secureCookies: cfg.relayUrl.startsWith('wss://')
+      });
+      const pairPage = createPairPageHandler({ pairing, fingerprint: keys.fingerprint, tickets, devices, audit: (entry) => audit.append(entry) });
+      const relay = new RelayConnector({
+        relayUrl: cfg.relayUrl,
+        relayToken: cfg.relayToken,
+        connectorId: keys.fingerprint,
+        devices,
+        tickets,
+        pairing,
+        policy,
+        credential,
+        keys,
+        audit: (entry) => audit.append(entry),
+        logger,
+        isKilled: () => killSwitch.enabled,
+        handlePairPage: (...args) => live.pairPage(...args)
+      });
+      return { pairing, pairPage, relay };
+    };
+    live = buildLive();
+
+    let relayOwned = false; // 展示用：boot 期是否取得了出站职责（面板改配置后按锁现状重新评估）
+    let relayLock = null;
+    /** 出站传输的启动门槛（boot 与面板改配置共用同一条）。
+     *  锁状态看 relayLock.owned 而非 boot 期的 relayOwned —— 否则「boot 时待机、
+     *  面板首次配置」的实例永远起不来（集成测试抓到的回归）。 */
+    const startRelayIfAllowed = (relay) => {
+      if (!cfg.relayUrl || killSwitch.enabled) return;
+      if (relayLock && !relayLock.owned) return;
+      relayOwned = true;
+      relay.start();
+    };
+    /** 令牌指纹（sha256 前 8 位）：面板可比对凭据是否同一把，令牌本体永不出机（§5.6）。 */
+    const tokenFp = () => (cfg.relayToken ? createHash('sha256').update(cfg.relayToken).digest('hex').slice(0, 8) : null);
+    const relayConfigStatus = () => {
+      const st = live.relay.status();
+      return {
+        effective: { relayUrl: cfg.relayUrl || null, relayPublicUrl: cfg.relayPublicUrl || null, relayTokenSet: Boolean(cfg.relayToken), relayTokenFp: tokenFp() },
+        sources: cfg.__sources ?? null,
+        override: { exists: Boolean(relayOverride.get()), changedAt: relayOverride.get()?.changedAt ?? null },
+        killswitch: { enabled: killSwitch.enabled },
+        relayOwned,
+        relay: { state: st.state, lastError: st.metrics.lastError ?? null }
+      };
+    };
+    const probeRelayConfig = (input) => {
+      const token = (String(input?.relayToken ?? '').trim()) || cfg.relayToken || '';
+      if (!token) return Promise.resolve({ ok: false, code: 'auth', reason: '令牌未设置：输入框留空且当前没有已配置的令牌' });
+      return probeRelay({ relayUrl: input?.relayUrl, relayToken: token, timeoutMs: 10_000 });
+    };
+    /** 面板「应用并重连」：校验 → 服务端复探针（不信任客户端缓存）→ 0600 落盘 → 原地生效 → 重建重连。 */
+    const applyRelayOverride = async (next) => {
+      const relayUrl = String(next?.relayUrl ?? '').trim();
+      const relayPublicUrl = String(next?.relayPublicUrl ?? '').trim();
+      const relayToken = String(next?.relayToken ?? '').trim();
+      if (killSwitch.enabled) return { ok: false, stage: 'killed', reason: 'kill switch 生效中：请先解除紧急停用再修改中继配置' };
+      // wss:// 一律放行；ws:// 仅限回环（本机联调）—— 远程明文入口永不接受（§5.5 坑 2）。
+      const loopbackWs = /^ws:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/i;
+      if (!/^wss:\/\//i.test(relayUrl) && !loopbackWs.test(relayUrl)) {
+        return { ok: false, stage: 'validate', reason: '中继地址只允许 wss://（本机联调可用 ws://127.0.0.1:端口）' };
+      }
+      if (relayPublicUrl && !/^https?:\/\//.test(relayPublicUrl)) return { ok: false, stage: 'validate', reason: '公网入口必须是 http(s):// 地址' };
+      if (!relayToken && !cfg.relayToken) return { ok: false, stage: 'validate', reason: '令牌必填：当前没有已配置的令牌，输入框不能留空' };
+      const probe = await probeRelayConfig({ relayUrl, relayToken });
+      if (!probe.ok) return { ok: false, stage: 'probe', code: probe.code, reason: probe.reason };
+      const publicUrl = relayPublicUrl || relayUrl.replace(/^wss/i, 'https');
+      try {
+        await relayOverride.set({ relayUrl, relayPublicUrl: publicUrl, relayToken });
+      } catch (error) {
+        return { ok: false, stage: 'write', reason: `写入 relay-override.json 失败：${error.message}` };
+      }
+      cfg.relayUrl = relayUrl;
+      cfg.relayToken = relayToken || cfg.relayToken;
+      cfg.relayPublicUrl = publicUrl;
+      cfg.__sources = {
+        relayUrl: 'override',
+        relayToken: relayToken ? 'override' : (cfg.__sources?.relayToken ?? 'default'),
+        relayPublicUrl: 'override'
+      };
+      live.relay.dispose();
+      live = buildLive();
+      startRelayIfAllowed(live.relay);
+      // 审计不含令牌本体，只有指纹前缀（§5.6）。
+      audit.append({ kind: 'relay.reconfigure', source: 'panel', relayUrl, tokenFingerprint: tokenFp() });
+      logger?.info?.(`[kite] 中继配置已应用（面板覆盖）→ ${relayUrl}`);
+      return { ok: true, effective: relayConfigStatus() };
+    };
 
     const adminHandler = createAdminHandler({
       adapter,
       killSwitch,
       devices,
-      pairing,
+      // 面板改配置会整体重建 pairing —— 走转发门面，路由层永远摸到当前实例。
+      pairing: {
+        begin: (...args) => live.pairing.begin(...args),
+        list: (...args) => live.pairing.list(...args),
+        abortAll: (...args) => live.pairing.abortAll(...args)
+      },
       audit,
       fingerprint: keys.fingerprint,
-      relayStatus: () => relay.status(),
-      kickDevice: (deviceId) => relay.kickDevice(deviceId),
+      relayStatus: () => live.relay.status(),
+      kickDevice: (deviceId) => live.relay.kickDevice(deviceId),
       relayPublicUrl: () => cfg.relayPublicUrl || null,
-      probe: () => runProbe({ adapter, credential, logger })
+      probe: () => runProbe({ adapter, credential, logger }),
+      relayConfigStatus,
+      probeRelayConfig,
+      applyRelayOverride
     });
-    deps = { adminHandler, relay, devices, credential, keys, relayOwned: false, relayLock: null };
+    deps = { adminHandler, relay: live.relay, devices, credential, keys, relayOwned: false, relayLock: null };
 
     // 设备触达的周期落盘（定时器纪律：只碰捕获对象）。
     const flushTimer = setInterval(() => {
@@ -225,23 +335,23 @@ export function apply(ctx, config) {
     flushTimer.unref?.();
 
     // 多宿主共存：同一数据目录只允许一个实例连接中继（否则同指纹抢座，请求随机 502）。
-    const relayLock = acquireRelayOwnerLock(dataDir, logger);
-    let relayOwned = false;
+    relayLock = acquireRelayOwnerLock(dataDir, logger);
     if (!cfg.relayUrl) {
-      logger?.info?.('[kite] relayUrl 未配置：管理面板可用，出站传输待机。');
+      logger?.info?.('[kite] relayUrl 未配置：管理面板可用（可在面板「中继接入」里直接配置），出站传输待机。');
     } else if (killSwitch.enabled) {
       logger?.warn?.('[kite] kill switch 生效中：出站传输保持断开（管理面板可恢复）。');
     } else if (!relayLock.owned) {
       logger?.warn?.(`[kite] 另一 DSH 实例（pid=${relayLock.holder}）持有中继：本实例出站传输待机。`);
     } else {
       relayOwned = true;
-      relay.start();
+      live.relay.start();
     }
     deps.relayOwned = relayOwned;
     deps.relayLock = relayLock;
     metrics.readyAt = Date.now();
     logger?.info?.(`[kite] ready in ${metrics.readyAt - metrics.startedAt}ms (fingerprint ${keys.fingerprint.slice(0, 12)}, devices ${devices.list().length})`);
-    return { relay, devices, credential, killSwitch, flushTimer };
+    // relay 用 getter：面板改配置重建后，清理逻辑释放的仍是当前实例。
+    return { get relay() { return live.relay; }, devices, credential, killSwitch, flushTimer };
   })();
 
   boot.catch((error) => {

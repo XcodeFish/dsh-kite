@@ -176,3 +176,17 @@ test('入口注入：global 行内嵌带 kite_token 的入口 URL', async () => 
   assert.equal(rows[0].value.url, '/kite?kite_token=abc');
   assert.equal(rows[1].kind, 'script');
 });
+
+test('管理面认证：中继配置路由同样在 adminAuth 之后（§5.6 设备侧另有前缀 deny 兜底）', async () => {
+  const { handler } = await fixture();
+  for (const [method, url] of [
+    ['GET', '/kite/api/relay'],
+    ['POST', '/kite/api/relay'],
+    ['POST', '/kite/api/relay/probe']
+  ]) {
+    const res = mockRes();
+    await handler({ method, url, headers: {} }, res);
+    assert.equal(res.status, 401, `${method} ${url} 必须被认证门拦下`);
+    assert.match(res.body, /认证失败/, `${method} ${url} 失败原因必须可读`);
+  }
+});

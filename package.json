@@ -1,6 +1,6 @@
 {
   "name": "dsh-kite",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "DSH 手机远程访问：纯出站三段式（本机零入站端口）+ 设备身份层（Ed25519 配对/票据/撤销）+ 权限收敛（远程会话预设锁定/方法黑名单/审计）。Connector 与插件同进程，经自建中继（只见密文/或 PWA 模式下 TLS 终结于中继）桥接手机。",

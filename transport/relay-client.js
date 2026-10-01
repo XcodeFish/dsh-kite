@@ -530,6 +530,79 @@ export class RelayConnector {
   }
 }
 
+/**
+ * ★ 中继接入预检探针（配置化面板 §5.5 坑 1：绝不能复用连接器自己的 connectorId）。
+ *
+ * 中继收到同 id 连接会执行 `connectors.get(id)?.close(4000, 'replaced')`，
+ * 直接把线上那条踢掉 —— 所以这里强制用 `probe-<随机>` 临时 id。
+ *
+ * 两段式分类（给用户可读的失败原因）：
+ *   ① GET {https 派生}/healthz —— 区分 dns / tls / timeout / server（连接被拒=服务没起）；
+ *   ② WSS 握手到 /connector 等 hello-ack —— healthz 已通而握手失败 = 令牌被拒（auth）。
+ * 返回 { ok:true, code:'ok', latencyMs } 或 { ok:false, code, reason }，
+ * code ∈ format|dns|tls|timeout|server|auth（对齐交互稿 §3.6-B）。
+ */
+export function probeRelay({ relayUrl, relayToken, timeoutMs = 10_000 } = {}) {
+  const url = String(relayUrl ?? '').trim();
+  // wss:// 一律放行；ws:// 仅限回环（本机联调），远程明文入口永不接受（§5.5 坑 2）。
+  const LOOPBACK_WS = /^ws:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/i;
+  if (!/^wss:\/\//i.test(url) && !LOOPBACK_WS.test(url)) {
+    return Promise.resolve({ ok: false, code: 'format', reason: '只允许 wss:// 地址（本机联调可用 ws://127.0.0.1:端口）' });
+  }
+  const healthBase = url.replace(/^ws/i, 'http').replace(/\/+$/, '');
+  const classifyNetworkError = (error) => {
+    const m = String(error?.cause?.message ?? error?.message ?? error);
+    if (/ENOTFOUND|EAI_AGAIN|getaddrinfo/i.test(m)) return { ok: false, code: 'dns', reason: `域名解析失败：${m.slice(0, 140)}` };
+    if (/CERT|SSL|TLS|self-signed/i.test(m)) return { ok: false, code: 'tls', reason: `TLS/证书异常：${m.slice(0, 140)}` };
+    if (/ECONNREFUSED/i.test(m)) return { ok: false, code: 'server', reason: '连接被立即拒绝 —— 中继服务大概率没在运行（systemctl status ra-relay）' };
+    if (error?.name === 'TimeoutError' || /TIMEOUT|abort/i.test(m)) return { ok: false, code: 'timeout', reason: '中继健康检查超时 —— 服务未运行或云防火墙未放行端口（丢包表现为持续超时）' };
+    return { ok: false, code: 'server', reason: `健康检查失败：${m.slice(0, 140)}` };
+  };
+  return fetch(`${healthBase}/healthz`, { signal: AbortSignal.timeout(Math.min(timeoutMs, 10_000)), redirect: 'manual' })
+    .then((health) => new Promise((resolve) => {
+      // healthz 通了（或返回任意 HTTP 状态）→ 进入 WSS 握手验证令牌。
+      void health;
+      const startedAt = Date.now();
+      const id = `probe-${randomUUID().replace(/-/g, '').slice(0, 12)}`;
+      const full = `${url.replace(/\/+$/, '')}/connector?c=${encodeURIComponent(id)}`;
+      const protocols = ['ra.v1'];
+      if (relayToken) {
+        if (SAFE_TOKEN.test(relayToken)) protocols.push(`ra-bearer.${relayToken}`);
+        else full += `&token=${encodeURIComponent(relayToken)}`;
+      }
+      let ws;
+      let settled = false;
+      const done = (result) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try { ws?.close(); } catch { /* ignore */ }
+        resolve(result);
+      };
+      const timer = setTimeout(() => done({ ok: false, code: 'timeout', reason: '握手无响应（10s 内未收到 hello-ack）' }), Math.max(2_000, Math.min(timeoutMs, 10_000)));
+      try {
+        ws = new WebSocket(full, protocols);
+      } catch (error) {
+        done({ ok: false, code: 'format', reason: `WebSocket 建立失败：${String(error?.message ?? error).slice(0, 140)}` });
+        return;
+      }
+      ws.onmessage = (event) => {
+        let frame;
+        try {
+          frame = decodeFrame(typeof event.data === 'string' ? event.data : Buffer.from(event.data).toString('utf8'));
+        } catch {
+          done({ ok: false, code: 'server', reason: '中继返回了无法解析的帧（部署的可能不是本中继）' });
+          return;
+        }
+        if (frame.kind === 'hello-ack') done({ ok: true, code: 'ok', latencyMs: Date.now() - startedAt, proto: frame.proto });
+        else done({ ok: false, code: 'server', reason: `中继握手返回了非预期帧（${frame.kind}）` });
+      };
+      ws.onclose = () => done({ ok: false, code: 'auth', reason: '中继拒绝了令牌（healthz 可达但 /connector 握手被 401）—— 核对 relayToken 与中继 RELAY_TOKENS 是否一致' });
+      ws.onerror = () => { /* onclose 跟随；分类交给 onclose */ };
+    }))
+    .catch((error) => classifyNetworkError(error));
+}
+
 function frameTs(frame) {
   return typeof frame.ts === 'number' ? frame.ts : Date.now();
 }

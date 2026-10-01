@@ -43,6 +43,43 @@ test('配置：env 覆盖优先于 patch config', () => {
   }
 });
 
+test('配置：四级优先级 env > override > patch > default（HANDOVER §5.3）', () => {
+  const prevUrl = process.env.DSH_KITE_RELAY_URL;
+  const prevToken = process.env.DSH_KITE_RELAY_TOKEN;
+  delete process.env.DSH_KITE_RELAY_URL;
+  delete process.env.DSH_KITE_RELAY_TOKEN;
+  try {
+    // override > patch
+    const withOverride = readConfig({ relayUrl: 'wss://patch.example', relayToken: 'patch-token' }, { relayUrl: 'wss://override.example', relayToken: '', relayPublicUrl: 'https://override.example' });
+    assert.equal(withOverride.relayUrl, 'wss://override.example');
+    assert.equal(withOverride.relayPublicUrl, 'https://override.example');
+    // override 令牌留空 = 沿用 patch 的令牌
+    assert.equal(withOverride.relayToken, 'patch-token');
+    assert.deepEqual(withOverride.__sources, { relayUrl: 'override', relayToken: 'patch', relayPublicUrl: 'override' });
+    // 无 override 时 patch 生效
+    const patchOnly = readConfig({ relayUrl: 'wss://patch.example' });
+    assert.equal(patchOnly.relayUrl, 'wss://patch.example');
+    assert.equal(patchOnly.__sources.relayUrl, 'patch');
+    // 都没有 → 默认
+    assert.equal(readConfig({}).relayUrl, '');
+    assert.equal(readConfig({}).__sources.relayUrl, 'default');
+    // env 最高
+    process.env.DSH_KITE_RELAY_URL = 'wss://env.example';
+    const withEnv = readConfig({ relayUrl: 'wss://patch.example' }, { relayUrl: 'wss://override.example' });
+    assert.equal(withEnv.relayUrl, 'wss://env.example');
+    assert.equal(withEnv.__sources.relayUrl, 'env');
+    // override 地址为空串 → 视为无覆盖（不是「清空配置」）
+    delete process.env.DSH_KITE_RELAY_URL;
+    const emptyOverride = readConfig({ relayUrl: 'wss://patch.example' }, { relayUrl: '' });
+    assert.equal(emptyOverride.relayUrl, 'wss://patch.example');
+  } finally {
+    if (prevUrl === undefined) delete process.env.DSH_KITE_RELAY_URL;
+    else process.env.DSH_KITE_RELAY_URL = prevUrl;
+    if (prevToken === undefined) delete process.env.DSH_KITE_RELAY_TOKEN;
+    else process.env.DSH_KITE_RELAY_TOKEN = prevToken;
+  }
+});
+
 test('数据目录：宿主进程无 DSH_PROFILE → default/', () => {
   const prev = process.env.DSH_PROFILE;
   delete process.env.DSH_PROFILE;

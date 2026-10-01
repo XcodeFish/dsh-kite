@@ -64,6 +64,8 @@ Node 版本：`^22.19.0 || >=24.0.0`（用全局 `WebSocket`，插件零外部�
     ticketTtlHours: 12                     # 设备票据有效期
 ```
 
+**面板可视化配置（v0.2.0 起）**：管理面板「中继接入」区可直接改中继地址/令牌/公网入口 —— 「测试连接」（临时 connectorId 预检，不挤掉在线连接）→「应用并重连」两步确认后写入 `$DSH_HOME/plugin-data/dsh-kite/<profile>/relay-override.json`（0600）并即时重连，**无需改文件、无需重启 DSH**。注意：① 改公网入口 = 所有已配对手机要重新扫码（面板确认层会醒目提示）；② 优先级 env > 面板覆盖 > patch > 默认，env 设置期间面板改动不生效（面板有来源徽标）；③ 面板只接受 `wss://`（本机联调额外接受 `ws://127.0.0.1` / `localhost`）；④ 令牌只在响应里以 sha256 指纹前 8 位出现，永不明文回显；⑤ 删除 relay-override.json 即回退。
+
 env 覆盖（调试用，优先于 patch）：`DSH_KITE_RELAY_URL` / `DSH_KITE_RELAY_TOKEN`。
 
 数据目录：`$DSH_HOME/plugin-data/dsh-kite/<profile>/`（宿主进程没有 `DSH_PROFILE`，实际落 `default/`；密钥/设备表/审计/kill switch 都在这里，密钥与设备表 0600）。更名前（v0.1 时代）的 `dsh-remote-access` 目录会在首次启动时**整体自动迁移**过来，已配对手机无需重新扫码。

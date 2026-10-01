@@ -16,6 +16,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const KILL_FILE = 'killswitch.json';
+const OVERRIDE_FILE = 'relay-override.json';
 const ADMIN_BODY_LIMIT = 64 * 1024;
 /** 浏览器端 QR 模块源码（面板页 `import('/kite/qr.js')` 用）。 */
 const QR_SOURCE = await fsp.readFile(path.join(path.dirname(fileURLToPath(import.meta.url)), 'qr.js'), 'utf8');
@@ -42,6 +43,49 @@ export class KillSwitch {
     this.#enabled = enabled === true;
     await fsp.writeFile(this.#file, JSON.stringify({ enabled: this.#enabled, changedAt: Date.now() }, null, 1), { mode: 0o600 });
     return this.#enabled;
+  }
+}
+
+/**
+ * 面板写入的中继覆盖配置（HANDOVER §5.2 数据契约）。与 KillSwitch 同构：
+ * 缺失或损坏 = **无覆盖**（静默回退 patch/默认，不引入新容错模型）；mode 0600。
+ * 删除文件即回退 —— 不做版本历史/回滚 UI 的理由见 §5.8。
+ */
+export class RelayOverrideStore {
+  #file;
+  #data = null;
+  constructor(dataDir) {
+    this.#file = path.join(dataDir, OVERRIDE_FILE);
+  }
+  async load() {
+    try {
+      const parsed = JSON.parse(await fsp.readFile(this.#file, 'utf8'));
+      this.#data = parsed && typeof parsed === 'object' ? parsed : null;
+    } catch {
+      this.#data = null;
+    }
+    return this.#data;
+  }
+  get() {
+    return this.#data;
+  }
+  async set(data) {
+    this.#data = {
+      relayUrl: String(data?.relayUrl ?? ''),
+      relayPublicUrl: String(data?.relayPublicUrl ?? ''),
+      relayToken: String(data?.relayToken ?? ''),
+      changedAt: Date.now()
+    };
+    await fsp.writeFile(this.#file, JSON.stringify(this.#data, null, 1), { mode: 0o600 });
+    return this.#data;
+  }
+  async clear() {
+    this.#data = null;
+    try {
+      await fsp.unlink(this.#file);
+    } catch {
+      /* 不存在即目标状态 */
+    }
   }
 }
 
@@ -214,10 +258,31 @@ export function createAdminHandler(deps) {
           killswitch: { enabled: deps.killSwitch.enabled },
           fingerprint: deps.fingerprint,
           relayPublicUrl: deps.relayPublicUrl() ?? null,
+          relayConfig: deps.relayConfigStatus ? deps.relayConfigStatus() : null,
           devices: deps.devices.list(),
           pairings: deps.pairing.list(),
           audit: deps.audit.tail(30)
         });
+        return;
+      }
+      // ---- 中继接入配置面（HANDOVER §5；全部在 adminAuth 之后，设备侧另有 /kite 前缀 deny 兜底）----
+      if (route === '/kite/api/relay' && req.method === 'GET') {
+        if (typeof deps.relayConfigStatus !== 'function') {
+          sendJson(res, 503, { error: '中继配置面未就绪（旧实例？重启后可用）' });
+          return;
+        }
+        sendJson(res, 200, deps.relayConfigStatus());
+        return;
+      }
+      if (route === '/kite/api/relay/probe' && req.method === 'POST') {
+        const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
+        sendJson(res, 200, await deps.probeRelayConfig(body));
+        return;
+      }
+      if (route === '/kite/api/relay' && req.method === 'POST') {
+        const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
+        const result = await deps.applyRelayOverride(body);
+        sendJson(res, result.ok ? 200 : (result.stage === 'killed' ? 409 : 400), result);
         return;
       }
       if (route === '/kite/api/pairings' && req.method === 'POST') {
@@ -443,6 +508,15 @@ pre{background:#0b0e12;border-radius:.6rem;padding:.8rem;font-size:.78rem;max-he
 <div class="card"><div class="row"><span id="relay-badge" class="badge idle">未知</span><span class="mono" id="relay-url"></span></div>
 <div class="note" id="relay-note" style="margin-top:.6rem"></div></div>
 
+<h2>中继接入（可视化配置）</h2>
+<div class="card"><div class="row"><span id="rc-badge" class="badge idle">未知</span><span class="mono" id="rc-effective">（未配置）</span></div>
+<div class="row" style="margin-top:.6rem"><input id="rc-url" placeholder="wss://中继地址:端口" style="flex:2;min-width:14rem"><input id="rc-token" type="password" placeholder="令牌（留空 = 沿用当前）" style="flex:1;min-width:10rem"><input id="rc-public" placeholder="公网入口（默认派生 https）" style="flex:1;min-width:12rem"></div>
+<div class="row" style="margin-top:.6rem"><button id="rc-probe">测试连接</button><button id="rc-apply" class="primary">应用并重连</button><span class="note" id="rc-msg"></span></div>
+<div id="rc-confirm" class="hidden" style="margin-top:.6rem;border:1px solid #d29922;border-radius:.5rem;padding:.6rem .8rem;background:#241a05">
+<div class="note" id="rc-summary"></div><div class="note" id="rc-rewarn" style="color:#f85149;display:none;margin-top:.3rem">⚠ 改公网入口 = 所有已配对手机都要重新扫码（设备私钥按 origin 隔离，新 origin 里没有它）。</div>
+<div class="row" style="margin-top:.5rem"><button id="rc-yes" class="primary">确认写入并重连</button><button id="rc-no">取消</button></div></div>
+<div class="note" id="rc-current" style="margin-top:.6rem"></div></div>
+
 <h2>添加设备（扫码连接）</h2>
 <div class="card"><div class="row"><input id="dev-name" placeholder="设备名（如 我的手机）"><button class="primary" id="btn-pair">生成配对二维码</button></div>
 <div id="pair-out" class="hidden" style="margin-top:1rem">
@@ -481,6 +555,7 @@ function badge(state) {
   el.className = 'badge ' + cls; el.textContent = label;
 }
 async function refresh() {
+  rcLoad();
   try {
     const s = await api('/kite/api/status');
     if (s.relayOwned === false && s.relay.state !== 'open') { $('relay-badge').className = 'badge idle'; $('relay-badge').textContent = '由另一 DSH 实例接管'; }
@@ -507,6 +582,81 @@ async function refresh() {
   } catch (e) { $('relay-note').textContent = '状态加载失败：' + e.message; }
 }
 function esc(s) { return String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+// ---- 中继接入（可视化配置）：令牌永不回显；探针走临时 connectorId；写入 0600 ----
+let rcData = null;
+const RC_HINT = {
+  format: '地址格式不对：只接受 wss:// 开头。',
+  dns: '域名解析失败：核对地址拼写，或服务器已下线。',
+  tls: 'TLS/证书异常：证书过期或不被信任（裸 IP 证书 7 天短期档，Caddy 会自动续）。',
+  timeout: '超时：服务未运行或云防火墙未放行端口（丢包表现为持续超时，秒回拒绝才是服务没起）。',
+  server: '中继异常：查看 /healthz 与日志；确认部署的是新版中继（/metrics 含 wire_frame_limit 行）。',
+  auth: '令牌被拒：与中继 RELAY_TOKENS 不一致，或当前未配置令牌。'
+};
+function rcSetMsg(text, bad) { const el = $('rc-msg'); el.textContent = text; el.style.color = bad ? '#f85149' : ''; }
+function rcInputUrl() { return $('rc-url').value.trim() || (rcData && rcData.effective.relayUrl) || ''; }
+function rcRender() {
+  if (!rcData) return;
+  const map = { open: ['ok', '已连接'], connecting: ['idle', '连接中'], retrying: ['idle', '重试中'], standby: ['idle', '待机'], killed: ['bad', '已紧急停用'] };
+  const [cls, label] = map[rcData.relay && rcData.relay.state] || ['bad', '未知'];
+  $('rc-badge').className = 'badge ' + cls; $('rc-badge').textContent = label;
+  $('rc-effective').textContent = (rcData.effective.relayUrl || '（未配置）') + (rcData.relay && rcData.relay.lastError ? ' · ' + rcData.relay.lastError : '');
+  const srcMap = { env: 'env（优先级最高，面板改动不生效）', override: '面板覆盖', patch: 'cordis.patch.yml', derived: '自动派生', default: '默认' };
+  const s = rcData.sources || {};
+  const tokenText = rcData.effective.relayTokenSet ? '已设置（指纹 ' + rcData.effective.relayTokenFp + '）' : '未设置';
+  $('rc-current').textContent = '生效来源：地址=' + (srcMap[s.relayUrl] || s.relayUrl) + ' · 令牌=' + (srcMap[s.relayToken] || s.relayToken) + ' · 入口=' + (srcMap[s.relayPublicUrl] || s.relayPublicUrl)
+    + '　|　令牌 ' + tokenText + '　|　覆盖文件 ' + (rcData.override && rcData.override.exists ? '存在（' + new Date(rcData.override.changedAt).toLocaleString() + ' 写入）' : '无');
+  const killed = rcData.killswitch && rcData.killswitch.enabled;
+  $('rc-apply').disabled = Boolean(killed);
+  if (killed) rcSetMsg('kill switch 生效中：解除后才可应用新配置', true);
+}
+function rcLoad() {
+  return api('/kite/api/relay').then((d) => { rcData = d; rcRender(); }).catch((e) => rcSetMsg('配置读取失败：' + e.message, true));
+}
+$('rc-url').oninput = () => {
+  const v = $('rc-url').value.trim();
+  // ws:// 仅回环放行（本机联调）；远程明文入口在输入阶段就拦下。
+  if (/^ws:\\/\\//i.test(v) && !/^ws:\\/\\/(127\\.0\\.0\\.1|localhost|\\[::1\\])/i.test(v)) rcSetMsg('✗ 远程地址只允许 wss://（本机联调可用 ws://127.0.0.1）', true);
+  else rcSetMsg('', false);
+};
+$('rc-probe').onclick = () => {
+  rcSetMsg('探测中…（临时 connectorId，不影响在线连接）', false);
+  $('rc-probe').disabled = true;
+  api('/kite/api/relay/probe', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ relayUrl: rcInputUrl(), relayToken: $('rc-token').value.trim(), relayPublicUrl: $('rc-public').value.trim() }) })
+    .then((r) => { if (r.ok) rcSetMsg('✓ 探针通过（' + (r.latencyMs || 0) + 'ms）· 可以「应用并重连」', false); else rcSetMsg('✗ ' + (RC_HINT[r.code] || '') + (r.reason ? '（' + r.reason + '）' : ''), true); })
+    .catch((e) => rcSetMsg('探针失败：' + e.message, true))
+    .then(() => { $('rc-probe').disabled = false; });
+};
+$('rc-apply').onclick = () => {
+  const url = rcInputUrl().trim();
+  if (!/^wss:\\/\\//i.test(url) && !/^ws:\\/\\/(127\\.0\\.0\\.1|localhost|\\[::1\\])(:\\d+)?(\\/|$)/i.test(url)) { rcSetMsg('✗ 远程地址只允许 wss://（本机联调可用 ws://127.0.0.1）', true); return; }
+  const pub = $('rc-public').value.trim() || url.replace(/^wss/i, 'https');
+  const changed = rcData && rcData.effective.relayPublicUrl && rcData.effective.relayPublicUrl !== pub;
+  $('rc-summary').textContent = '将写入并生效：地址 ' + url + ' ｜ 公网入口 ' + pub + ' ｜ 令牌 ' + ($('rc-token').value.trim() ? '更新为新值' : '沿用当前');
+  $('rc-rewarn').style.display = changed ? 'block' : 'none';
+  $('rc-confirm').classList.remove('hidden');
+  $('rc-apply').disabled = true;
+};
+$('rc-no').onclick = () => { $('rc-confirm').classList.add('hidden'); $('rc-apply').disabled = false; };
+$('rc-yes').onclick = () => {
+  $('rc-yes').disabled = true;
+  rcSetMsg('写入并重连中…', false);
+  api('/kite/api/relay', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ relayUrl: rcInputUrl(), relayToken: $('rc-token').value.trim(), relayPublicUrl: $('rc-public').value.trim() }) })
+    .then((r) => {
+      if (r.ok) {
+        rcSetMsg('✓ 已写入 relay-override.json 并重连（来源：面板覆盖；删该文件即回退）', false);
+        $('rc-token').value = '';
+        $('rc-confirm').classList.add('hidden');
+        $('rc-apply').disabled = false;
+        refresh();
+      } else {
+        const prefix = r.stage === 'killed' ? '被拒绝' : (r.stage === 'probe' ? '探针未通过' : (r.stage === 'write' ? '写入失败' : '校验未通过'));
+        rcSetMsg('✗ ' + prefix + '：' + (r.code ? (RC_HINT[r.code] || '') + ' ' : '') + (r.reason || ''), true);
+        if (r.stage !== 'validate') { $('rc-confirm').classList.add('hidden'); $('rc-apply').disabled = false; }
+      }
+    })
+    .catch((e) => rcSetMsg('请求失败：' + e.message, true))
+    .then(() => { $('rc-yes').disabled = false; });
+};
 window.revoke = async (id) => { await api('/kite/api/devices/' + encodeURIComponent(id), { method: 'DELETE' }); refresh(); };
 $('btn-pair').onclick = async () => {
   const name = $('dev-name').value.trim() || 'phone';
