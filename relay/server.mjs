@@ -460,7 +460,20 @@ function handlePhoneHttp(req, res) {
 // ---- WebSocket 面 ----
 
 // maxPayload 用【线上帧上限】而非应用层上限 —— 见 MAX_WIRE_FRAME_BYTES 的说明。
-const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_WIRE_FRAME_BYTES });
+// ★ perMessageDeflate 实际只压**手机浏览器**的流量：/connector 的连接器握手虽也经
+//   此 wss，但连接器是 Node 内置 WebSocket（undici），不实现 pmd，握手时不带
+//   pmd 扩展头，协商自然不成立 —— 配置对它无副作用。assistant 实时流（平均
+//   29KB/条 assistant/message）走 base64 JSON 帧全程无压缩，是「同步不跟手」的
+//   主因之一（真机 2026-10-02）；pmd 在中继↔手机这段把 JSON 文本压回 ~15–25%。
+//   threshold：<1KB 的帧不值得压（控制帧/小 RPC 占多数，避免 CPU 空转）。
+const wss = new WebSocketServer({
+  noServer: true,
+  maxPayload: MAX_WIRE_FRAME_BYTES,
+  perMessageDeflate: {
+    threshold: 1024,
+    noDelay: true
+  }
+});
 
 function bearerFromProtocols(protocols) {
   for (const proto of protocols ?? []) {
