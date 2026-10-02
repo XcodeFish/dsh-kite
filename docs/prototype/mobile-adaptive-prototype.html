@@ -1,0 +1,527 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DSH 全功能面 · 移动端自适应交互原型 v1</title>
+<style>
+/* ============ 原型外壳（模拟器控制台，非被测 UI） ============ */
+:root{
+  --bg:#09090b; --panel:#0e1116; --card:#151a21; --line:#232b36; --line2:#1d242e;
+  --fg:#e6e8eb; --dim:#9aa4b2; --faint:#6b7684; --acc:#2f81f7; --ok:#7ee2b8; --warn:#e3b341; --bad:#f85149;
+  --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+*{box-sizing:border-box}
+html{color-scheme:dark}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.6 system-ui,-apple-system,"PingFang SC",sans-serif}
+button{font:inherit;cursor:pointer}
+h1{font-size:15px;margin:0}
+h2{font-size:13px;margin:0 0 8px;color:var(--dim);font-weight:600}
+.console{max-width:1180px;margin:0 auto;padding:14px 16px 30px}
+.console-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:10px}
+.console-head .tag{font-size:11px;color:var(--faint)}
+.ctrls{display:flex;align-items:center;gap:10px;flex-wrap:wrap;background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+.ctrls label{font-size:12px;color:var(--dim)}
+.ctrls input[type=range]{width:280px;accent-color:var(--acc)}
+.preset{border:1px solid var(--line);background:transparent;color:var(--dim);border-radius:6px;padding:4px 10px;font-size:12px}
+.preset.on{border-color:var(--acc);color:#9ec3ff}
+.preset:hover{color:var(--fg)}
+.width-read{font-family:var(--mono);font-size:12px;color:#9ec3ff;min-width:64px}
+.bp-hint{font-size:11px;color:var(--faint)}
+.bp-hint b{color:var(--warn);font-weight:600}
+.toggles{display:flex;gap:8px;flex-wrap:wrap;margin-left:auto}
+.tg{border:1px solid var(--line);background:transparent;color:var(--dim);border-radius:6px;padding:4px 10px;font-size:12px}
+.tg.on{border-color:var(--ok);color:var(--ok)}
+.surface-tabs{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}
+.surface-tabs button{border:1px solid var(--line);background:transparent;color:var(--dim);border-radius:999px;padding:4px 12px;font-size:12px}
+.surface-tabs button.on{border-color:var(--acc);color:#9ec3ff;background:rgba(47,129,247,.08)}
+
+/* ============ 设备框（被测容器 · container query 作用域） ============ */
+.stage{display:flex;gap:18px;align-items:flex-start}
+.device-wrap{flex:0 0 auto;transition:width .18s ease;max-width:100%}
+.device{width:100%;height:660px;background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden;position:relative;display:flex;flex-direction:column;container-type:inline-size;container-name:app}
+.device.phone-bezel{border-radius:28px;border:6px solid #1b2129;box-shadow:0 12px 40px rgba(0,0,0,.5)}
+.stage-side{flex:1;min-width:300px;max-width:420px}
+.note-card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:10px}
+.note-card h3{margin:0 0 6px;font-size:12px;color:#9ec3ff}
+.note-card p,.note-card li{font-size:12px;color:var(--dim);margin:4px 0;line-height:1.7}
+.note-card ul{margin:4px 0;padding-left:18px}
+.note-card b{color:var(--fg);font-weight:600}
+.mono{font-family:var(--mono);font-size:11px}
+
+/* ============ 应用骨架（模拟 DSH GUI） ============ */
+.app{position:absolute;inset:0;display:flex;flex-direction:column;font-size:13px}
+.topbar{flex:0 0 auto;height:46px;display:flex;align-items:center;gap:10px;padding:0 12px;border-bottom:1px solid var(--line2);background:rgba(14,17,22,.9)}
+.icon-btn{width:34px;height:34px;flex:0 0 auto;display:grid;place-items:center;border:1px solid transparent;background:transparent;color:var(--dim);border-radius:8px;font-size:15px}
+.icon-btn:hover{background:#1a2028;color:var(--fg)}
+.topbar .title{font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.topbar .spacer{flex:1}
+.pill{border:1px solid var(--line);border-radius:999px;padding:3px 10px;font-size:11px;color:var(--dim);white-space:nowrap}
+.pill.model{color:#9ec3ff;border-color:rgba(110,168,254,.35)}
+.avatar{width:26px;height:26px;border-radius:50%;background:linear-gradient(135deg,#2f81f7,#7c5cff);flex:0 0 auto}
+
+.app-body{flex:1;display:flex;min-height:0}
+/* 左侧栏（会话列表） */
+.left{flex:0 0 230px;border-right:1px solid var(--line2);display:flex;flex-direction:column;background:#0c1015;min-height:0}
+.left .new-btn{margin:10px;padding:8px;border:1px solid var(--acc);border-radius:8px;background:rgba(47,129,247,.12);color:#9ec3ff;font-size:12px}
+.sess-list{overflow:auto;padding:0 8px 10px;flex:1}
+.sess{padding:8px 10px;border-radius:8px;color:var(--dim);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sess.on{background:#1a2028;color:var(--fg)}
+.sess small{display:block;color:var(--faint);font-size:10px}
+/* 主区 */
+.main{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0}
+.stream{flex:1;overflow:auto;padding:14px 16px;display:flex;flex-direction:column;gap:12px}
+.msg{max-width:76%;padding:9px 12px;border-radius:12px;font-size:12.5px;line-height:1.65}
+.msg.user{align-self:flex-end;background:#1f2c3f;border-bottom-right-radius:4px}
+.msg.ai{align-self:flex-start;background:#151c25;border:1px solid var(--line2);border-bottom-left-radius:4px}
+.msg .meta{font-size:10px;color:var(--faint);margin-bottom:4px;display:flex;gap:8px;align-items:center}
+.toolchip{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--line);border-radius:6px;padding:2px 8px;font-size:11px;color:var(--dim);font-family:var(--mono)}
+.codeblk{background:#0b0e12;border:1px solid var(--line2);border-radius:8px;padding:8px 10px;font-family:var(--mono);font-size:11px;overflow:auto;white-space:pre;color:#c9d1d9;margin:6px 0 0}
+/* 审批卡 */
+.approval{align-self:stretch;max-width:none;border:1px solid rgba(227,179,65,.4);background:#1c1608;border-radius:12px;padding:12px 14px}
+.approval .a-head{display:flex;gap:8px;align-items:center;font-size:12px;color:var(--warn);font-weight:600}
+.approval .a-body{font-size:12px;color:var(--dim);margin:8px 0;font-family:var(--mono);background:#120e04;border-radius:8px;padding:8px 10px;overflow:auto;max-height:110px;white-space:pre}
+.approval .a-actions{display:flex;gap:8px}
+.abtn{flex:1;padding:9px 0;border-radius:8px;font-size:13px;border:1px solid var(--line)}
+.abtn.allow{background:var(--acc);border-color:var(--acc);color:#fff}
+.abtn.deny{background:transparent;color:var(--bad);border-color:rgba(248,81,73,.5)}
+/* 右侧栏（文件/终端/交付物 tabs） */
+.right{flex:0 0 270px;border-left:1px solid var(--line2);display:flex;flex-direction:column;background:#0c1015;min-height:0}
+.right .rtabs{display:flex;border-bottom:1px solid var(--line2);flex:0 0 auto}
+.right .rtabs button{flex:1;padding:9px 0;background:transparent;border:0;color:var(--faint);font-size:11px;border-bottom:2px solid transparent}
+.right .rtabs button.on{color:var(--fg);border-bottom-color:var(--acc)}
+.rpane{flex:1;overflow:auto;padding:10px;font-size:12px;color:var(--dim)}
+.file-row{display:flex;gap:8px;align-items:center;padding:6px 6px;border-radius:6px}
+.file-row:hover{background:#141a22}
+.file-row .fname{flex:1;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.term{font-family:var(--mono);font-size:11px;color:#9ec3ff;white-space:pre;background:#07090c;border-radius:8px;padding:10px;height:100%;overflow:auto}
+/* 输入区 */
+.composer{flex:0 0 auto;border-top:1px solid var(--line2);padding:10px 14px 12px;display:flex;flex-direction:column;gap:8px}
+.c-row1{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.chip{border:1px solid var(--line);border-radius:999px;padding:3px 10px;font-size:11px;color:var(--dim);display:inline-flex;gap:5px;align-items:center}
+.c-row2{display:flex;gap:8px;align-items:flex-end}
+.c-input{flex:1;background:#0b0e12;border:1px solid var(--line);border-radius:10px;color:var(--fg);padding:9px 12px;font-size:13px;font-family:inherit;min-height:38px;resize:none}
+.send{flex:0 0 auto;width:38px;height:38px;border-radius:10px;border:0;background:var(--acc);color:#fff;font-size:15px;display:grid;place-items:center}
+.send.off{background:#29313c;color:#6b7684}
+/* 页面类 surface（设置/市场/任务） */
+.page{flex:1;overflow:auto;padding:14px 16px}
+.page h4{margin:2px 0 10px;font-size:14px}
+.set-list{border:1px solid var(--line2);border-radius:10px;overflow:hidden}
+.set-item{display:flex;align-items:center;gap:12px;padding:11px 14px;border-bottom:1px solid var(--line2);background:#10151c}
+.set-item:last-child{border-bottom:0}
+.set-item .ic{width:28px;height:28px;border-radius:8px;background:#1a2028;display:grid;place-items:center;font-size:13px}
+.set-item .nm{flex:1;font-size:12.5px}
+.set-item .nm small{display:block;color:var(--faint);font-size:10.5px}
+.set-item .arrow{color:var(--faint)}
+.sw{width:34px;height:20px;border-radius:999px;background:#29313c;position:relative}
+.sw::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:50%;background:#8b949e}
+.sw.on{background:rgba(47,129,247,.4)}.sw.on::after{left:16px;background:var(--acc)}
+.mk-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px}
+.mk-card{border:1px solid var(--line2);border-radius:10px;padding:10px;background:#10151c}
+.mk-card .ic{font-size:18px}
+.mk-card .nm{font-size:12px;margin:4px 0 2px}
+.mk-card .ds{font-size:10.5px;color:var(--faint);line-height:1.5}
+.mk-card .ins{margin-top:8px;font-size:10px;color:#9ec3ff;border:1px solid rgba(110,168,254,.35);border-radius:6px;padding:3px 8px;display:inline-block}
+.job{border:1px solid var(--line2);border-left:3px solid var(--acc);border-radius:8px;padding:8px 12px;margin-bottom:8px;background:#10151c}
+.job .jt{display:flex;justify-content:space-between;font-size:12px}
+.job .jd{font-size:11px;color:var(--faint);margin-top:2px}
+.prog{height:4px;border-radius:2px;background:#1d242e;margin-top:8px;overflow:hidden}
+.prog i{display:block;height:100%;background:var(--acc);border-radius:2px}
+
+/* ============ ★ 容器查询：自适应核心（与真机注入层同规则） ============ */
+/* 断点一：≤899px 平板/横屏折叠 —— 左栏收抽屉、右栏进底栏 */
+@container app (max-width: 899.9px){
+  .left{position:absolute;z-index:30;top:0;bottom:0;left:0;width:264px;transform:translateX(-105%);transition:transform .22s ease;box-shadow:8px 0 30px rgba(0,0,0,.45)}
+  .app.drawer-open .left{transform:none}
+  .scrim{position:absolute;inset:0;z-index:25;background:rgba(4,6,10,.55);opacity:0;pointer-events:none;transition:opacity .2s}
+  .app.drawer-open .scrim{opacity:1;pointer-events:auto}
+  .btn-menu{display:grid}
+  .right{position:absolute;z-index:30;left:0;right:0;bottom:0;top:auto;height:52%;border-left:0;border-top:1px solid var(--line);border-radius:14px 14px 0 0;transform:translateY(105%);transition:transform .22s ease;box-shadow:0 -10px 30px rgba(0,0,0,.45)}
+  .app.sheet-open .right{transform:none}
+  .right .rtabs button{padding:11px 0;font-size:12px}
+  /* ★ 底部 Tab 是绝对定位覆盖层：主区内容必须让出 52px，否则盖住输入区 */
+  .main{padding-bottom:52px}
+  .sheet-grip{display:block}
+  .msg{max-width:88%}
+}
+/* 断点二：≤639px 手机 —— 输入区堆叠、审批全宽、顶栏精简 */
+@container app (max-width: 639.9px){
+  .topbar{padding:0 8px;gap:6px}
+  .topbar .title{font-size:12.5px}
+  .topbar .pill.model{display:none}          /* 模型选择收进输入区 chip */
+  .topbar .avatar{display:none}              /* 头像收进「更多」抽屉 */
+  .stream{padding:12px}
+  .msg{max-width:100%}
+  .codeblk{max-height:180px}                 /* 长代码折叠成可滚动块 */
+  .approval .a-actions{flex-direction:row}   /* 双大按钮保持拇指可达（44px） */
+  .approval .a-body{max-height:90px}
+  .composer{padding:8px 10px calc(10px + 2px)}
+  .c-input{font-size:16px}                   /* ★ ≥16px 防 iOS 聚焦自动放大 */
+  .c-input{min-height:44px}
+  .send{width:44px;height:44px}              /* ★ 44px 触控目标 */
+  .icon-btn{width:40px;height:40px}
+  .mk-grid{grid-template-columns:repeat(2,1fr)}
+  .set-item{padding:13px 12px}
+  .set-item .ic{width:34px;height:34px}      /* 设置行加高便于点按 */
+}
+/* ≥900px 时隐藏移动专属控件 */
+.btn-menu,.sheet-grip,.bottom-tabs{display:none}
+.scrim{display:block}
+@container app (min-width: 900px){
+  .scrim{display:none}
+  .main{padding-bottom:0}
+}
+/* 手机 bezel 模式下的安全区示意 */
+.safe-demo{position:absolute;inset:0;pointer-events:none;border:0 solid rgba(126,226,184,.35);display:none}
+.device.show-safe .safe-demo{display:block;border-top-width:24px;border-bottom-width:18px}
+.safe-demo::before{content:"safe-area-inset-top";position:absolute;top:2px;left:50%;transform:translateX(-50%);font-size:9px;color:var(--ok);font-family:var(--mono)}
+.safe-demo::after{content:"safe-area-inset-bottom";position:absolute;bottom:1px;left:50%;transform:translateX(-50%);font-size:9px;color:var(--ok);font-family:var(--mono)}
+/* 注释气泡 */
+.anno{position:absolute;z-index:40;font-size:10px;font-family:var(--mono);color:var(--warn);border:1px dashed rgba(227,179,65,.6);border-radius:6px;padding:2px 6px;background:rgba(20,14,2,.9);pointer-events:none;display:none}
+body.notes-on .anno{display:block}
+
+/* 抽屉句柄（手机端底部 sheet） */
+.sheet-grip{position:absolute;top:6px;left:50%;transform:translateX(-50%);width:40px;height:4px;border-radius:2px;background:#3a4452;z-index:31}
+.bottom-tabs{position:absolute;left:0;right:0;bottom:0;z-index:20;display:flex;background:#0b0f14;border-top:1px solid var(--line2)}
+@container app (max-width: 899.9px){
+  .bottom-tabs{display:flex}
+}
+.bottom-tabs button{flex:1;height:52px;background:transparent;border:0;color:var(--faint);font-size:10.5px;display:flex;flex-direction:column;gap:2px;align-items:center;justify-content:center}
+.bottom-tabs button .bi{font-size:16px}
+.bottom-tabs button.on{color:#9ec3ff}
+</style>
+</head>
+<body>
+<div class="console">
+  <div class="console-head">
+    <h1>DSH 全功能面 · 移动端自适应交互原型</h1>
+    <span class="tag">v1 · 2026-10-02 · 对应 53 个 client-ui 功能面 · 拖动宽度实时重排</span>
+  </div>
+
+  <div class="ctrls">
+    <label>视口宽度</label>
+    <input type="range" id="w" min="340" max="1280" step="1" value="1180">
+    <span class="width-read" id="wr">1180px</span>
+    <button class="preset" data-w="1280">桌面 1280</button>
+    <button class="preset" data-w="820">平板 820</button>
+    <button class="preset" data-w="430">手机 Max 430</button>
+    <button class="preset" data-w="375">手机 375</button>
+    <button class="preset" data-w="340">SE 340</button>
+    <span class="bp-hint">断点：<b>≤899</b> 侧栏→抽屉 / 右栏→底部sheet · <b>≤639</b> 输入堆叠/触控44px</span>
+    <div class="toggles">
+      <button class="tg" id="tg-bezel">手机外壳</button>
+      <button class="tg" id="tg-safe">安全区示意</button>
+      <button class="tg" id="tg-notes">适配注释</button>
+    </div>
+  </div>
+
+  <div class="surface-tabs" id="stabs">
+    <button data-s="chat" class="on">会话 · 聊天流</button>
+    <button data-s="approval">审批 / 提问卡</button>
+    <button data-s="terminal">终端</button>
+    <button data-s="files">文件 · 交付物</button>
+    <button data-s="settings">设置</button>
+    <button data-s="market">插件市场</button>
+    <button data-s="jobs">任务 · 计划</button>
+  </div>
+
+  <div class="stage">
+    <div class="device-wrap" id="devwrap" style="width:1180px">
+      <div class="device" id="dev">
+        <div class="safe-demo"></div>
+        <div class="app" id="app">
+          <!-- 顶栏 -->
+          <div class="topbar">
+            <button class="icon-btn btn-menu" id="btn-menu" title="会话列表">☰</button>
+            <div class="title">MoonStarsLab — 会话</div>
+            <div class="spacer"></div>
+            <span class="pill model">M3.1-Flash-Preview</span>
+            <span class="pill">⌂ 本机</span>
+            <button class="icon-btn" title="新会话">＋</button>
+            <button class="icon-btn" id="btn-right" title="文件/终端">▭</button>
+            <div class="avatar"></div>
+          </div>
+
+          <div class="app-body">
+            <!-- 左侧：会话列表 -->
+            <aside class="left" id="left">
+              <button class="new-btn">＋ 新会话</button>
+              <div class="sess-list">
+                <div class="sess on">MoonStarsLab 主线<small>4 分钟前 · 199 步</small></div>
+                <div class="sess">kite 中继排障<small>1 小时前</small></div>
+                <div class="sess">Jet-Hub 0.4.1 补丁<small>昨天</small></div>
+                <div class="sess">magpie 405 分析<small>昨天</small></div>
+                <div class="sess">bonsai 清理<small>3 天前</small></div>
+                <div class="sess">工作区重构<small>10-01</small></div>
+                <div class="sess">原型评审<small>09-30</small></div>
+              </div>
+            </aside>
+
+            <!-- 主区：按 surface 切换 -->
+            <section class="main" id="main">
+              <!-- chat -->
+              <div class="stream" data-surface="chat">
+                <div class="msg user">手机上整个 DSH 界面都要能自适应，不只是聊天。</div>
+                <div class="msg ai"><div class="meta">M3.1-Flash-Preview · 16:02</div>明白，我盘了 53 个 client-ui 功能面，侧栏收抽屉、右栏进底部 sheet、审批卡全宽……<div class="codeblk">dsh-ui {"items":[…53 个功能包…]}</div></div>
+                <div class="msg user">先出交互原型看看。</div>
+                <div class="msg ai"><div class="meta"><span class="toolchip">⚙ read proxy/reverse-proxy.js</span><span class="toolchip">⚙ probe asar</span></div>正在生成全功能面原型，当前宽度下你看到的就是桌面布局 —— 拖动顶部滑块到 430px 看手机形态。</div>
+              </div>
+
+              <!-- approval -->
+              <div class="stream" data-surface="approval" hidden>
+                <div class="msg ai">需要对工作区执行一次写入操作，等待你的确认。</div>
+                <div class="approval">
+                  <div class="a-head">⚠ 权限请求 · write</div>
+                  <div class="a-body">edit  /Users/guobinbin/Downloads/dsh-remote-access-20261001-683242b/admin/panel-client.js
+  +0  -2  隐藏手机端悬浮按钮（/kite 在设备侧被策略 404）</div>
+                  <div class="a-actions">
+                    <button class="abtn allow">允许</button>
+                    <button class="abtn deny">拒绝</button>
+                  </div>
+                </div>
+                <div class="msg user" style="max-width:88%">手机上这个卡要占满宽、按钮要够大。</div>
+              </div>
+
+              <!-- terminal -->
+              <div class="stream" data-surface="terminal" hidden style="padding:10px">
+                <div class="term" style="max-height:none">$ dsh plugin --profile web list
+kite            0.2.1   enabled
+mnemon          0.5.16  enabled
+billion-context 0.1.160 enabled
+$ █</div>
+              </div>
+
+              <!-- files -->
+              <div class="stream" data-surface="files" hidden>
+                <div class="file-row">📄 <span class="fname">README.md</span><span class="mono" style="color:var(--faint)">14.6 KB</span></div>
+                <div class="file-row">📄 <span class="fname">admin/panel-client.js</span><span class="mono" style="color:var(--faint)">504 行</span></div>
+                <div class="file-row">📄 <span class="fname">docs/交互稿-中继可视化配置.md</span><span class="mono" style="color:var(--faint)">—</span></div>
+                <div class="file-row">📦 <span class="fname">dsh-kite-0.2.1.tgz</span><span class="mono" style="color:#9ec3ff">交付物</span></div>
+                <div class="file-row">🖼 <span class="fname">prototype-preview.png</span><span class="mono" style="color:#9ec3ff">交付物</span></div>
+              </div>
+
+              <!-- settings -->
+              <div class="page" data-surface="settings" hidden>
+                <h4>设置</h4>
+                <div class="set-list">
+                  <div class="set-item"><div class="ic">👤</div><div class="nm">账号与订阅<small>DeepSeek 登录 · GLM Coding Plan</small></div><span class="arrow">›</span></div>
+                  <div class="set-item"><div class="ic">🤖</div><div class="nm">模型<small>默认渠道 · 免费徽标</small></div><span class="arrow">›</span></div>
+                  <div class="set-item"><div class="ic">Plugins</div><div class="nm">插件<small>18 已启用</small></div><span class="arrow">›</span></div>
+                  <div class="set-item"><div class="ic">🌐</div><div class="nm">浏览器访问<small>Browser Access 开关</small></div><div class="sw on"></div></div>
+                  <div class="set-item"><div class="ic">⌨</div><div class="nm">快捷键<small>桌面端专属</small></div><span class="pill">仅桌面</span></div>
+                  <div class="set-item"><div class="ic">🔒</div><div class="nm">权限预设<small>远程会话锁定 default</small></div><span class="arrow">›</span></div>
+                </div>
+              </div>
+
+              <!-- market -->
+              <div class="page" data-surface="market" hidden>
+                <h4>插件市场 <span class="mono" style="font-size:10px;color:var(--faint)">4367 条</span></h4>
+                <div class="mk-grid">
+                  <div class="mk-card"><div class="ic">🪁</div><div class="nm">dsh-kite</div><div class="ds">手机远程访问 · 纯出站</div><span class="ins">已安装</span></div>
+                  <div class="mk-card"><div class="ic">🧠</div><div class="nm">dsh-mnemon</div><div class="ds">记忆控制平面</div><span class="ins">已安装</span></div>
+                  <div class="mk-card"><div class="ic">📏</div><div class="nm">billion-context</div><div class="ds">上下文压缩代理</div><span class="ins">已安装</span></div>
+                  <div class="mk-card"><div class="ic">✈️</div><div class="nm">dsh-pilot</div><div class="ds">编码驾驶舱</div><span class="ins">安装</span></div>
+                  <div class="mk-card"><div class="ic">💬</div><div class="nm">dsh-im-connect</div><div class="ds">微信接入</div><span class="ins">安装</span></div>
+                  <div class="mk-card"><div class="ic">🎨</div><div class="nm">effort-ultra-skin</div><div class="ds">推理档位皮肤</div><span class="ins">安装</span></div>
+                </div>
+              </div>
+
+              <!-- jobs -->
+              <div class="page" data-surface="jobs" hidden>
+                <h4>任务 · 计划</h4>
+                <div class="job"><div class="jt"><span>P0 注入骨架（content-length 修复）</span><span class="mono" style="color:#7ee2b8">进行中</span></div><div class="jd">mobile-skin.js · reverse-proxy 注入点 · 契约测试 ×6</div><div class="prog"><i style="width:62%"></i></div></div>
+                <div class="job" style="border-left-color:var(--warn)"><div class="jt"><span>P1 全功能面 token 覆盖</span><span class="mono" style="color:var(--warn)">待真机校准</span></div><div class="jd">--dsw-* 变量 · 侧栏/输入区/审批卡/设置/市场</div><div class="prog"><i style="width:18%;background:var(--warn)"></i></div></div>
+                <div class="job" style="border-left-color:var(--faint)"><div class="jt"><span>P2 kite 自有 UI 移动化</span><span class="mono" style="color:var(--faint)">排队</span></div><div class="jd">浮层全屏 sheet · /kite 独立页 @media</div></div>
+                <div class="job" style="border-left-color:var(--ok)"><div class="jt"><span>交互原型（本页）</span><span class="mono" style="color:#7ee2b8">完成</span></div><div class="jd">docs/prototype/mobile-adaptive-prototype.html</div></div>
+              </div>
+
+              <!-- 输入区（chat 专属，但页面态显示精简版） -->
+              <div class="composer" id="composer">
+                <div class="c-row1">
+                  <span class="chip">📎 附件</span>
+                  <span class="chip">🧩 技能</span>
+                  <span class="chip" id="c-model">M3.1-Flash-Preview ▾</span>
+                  <span class="chip">预设 default ▾</span>
+                </div>
+                <div class="c-row2">
+                  <textarea class="c-input" rows="1" placeholder="发消息给 DSH…"></textarea>
+                  <button class="send off" id="send">↑</button>
+                </div>
+              </div>
+            </section>
+
+            <!-- 右侧：文件/终端/交付物（桌面为栏，窄屏为底部 sheet） -->
+            <aside class="right" id="right">
+              <div class="sheet-grip" id="grip"></div>
+              <div class="rtabs">
+                <button class="on" data-t="files">文件</button>
+                <button data-t="term">终端</button>
+                <button data-t="deliver">交付物</button>
+              </div>
+              <div class="rpane" data-t="files">
+                <div class="file-row">📄 <span class="fname">mobile-skin.js</span></div>
+                <div class="file-row">📄 <span class="fname">reverse-proxy.js</span></div>
+                <div class="file-row">📄 <span class="fname">panel-relay-config.test.mjs</span></div>
+              </div>
+              <div class="rpane" data-t="term" hidden>
+                <div class="term">$ tail -f harness.log
+[kite] relay open wss://…
+[kite] devices=1
+$ █</div>
+              </div>
+              <div class="rpane" data-t="deliver" hidden>
+                <div class="file-row">📦 mobile-adaptive-prototype.html</div>
+                <div class="file-row">📦 适配方案-v2.md</div>
+                <div class="file-row" style="color:var(--faint)">交付物会以卡片出现在对话流，也可在此面板取回。</div>
+              </div>
+            </aside>
+          </div>
+
+          <!-- 底部导航（≤899 显示）：聊天/文件/终端/更多 -->
+          <nav class="bottom-tabs" id="btabs">
+            <button class="on" data-b="chat"><span class="bi">💬</span>聊天</button>
+            <button data-b="files"><span class="bi">📄</span>文件</button>
+            <button data-b="term"><span class="bi">⌨</span>终端</button>
+            <button data-b="more"><span class="bi">☰</span>更多</button>
+          </nav>
+
+          <div class="scrim" id="scrim"></div>
+          <span class="anno" style="top:52px;left:8px" id="an-left">左栏→汉堡抽屉(≤899)</span>
+          <span class="anno" style="top:52px;right:8px" id="an-right">右栏→底部sheet(≤899)</span>
+          <span class="anno" style="bottom:64px;left:10px" id="an-comp">输入16px防缩放/44px触控(≤639)</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="stage-side">
+      <div class="note-card">
+        <h3>这份原型演示什么</h3>
+        <ul>
+          <li><b>拖滑块 / 点预设</b>：宽度实时变化，内部是真实 <span class="mono">@container</span> 查询 —— 与真机注入层用同一套规则，看到的重排就是实现后的行为。</li>
+          <li><b>切功能页签</b>：聊天流 / 审批卡 / 终端 / 文件交付 / 设置 / 市场 / 任务 —— 覆盖 53 个 client-ui 包的主要面。</li>
+          <li><b>「手机外壳」「安全区」开关</b>：模拟刘海与 home 条，对应注入层 <span class="mono">viewport-fit=cover + env(safe-area-*)</span>。</li>
+          <li><b>「适配注释」</b>：叠加标注每处适配点（P0/P1 归属）。</li>
+        </ul>
+      </div>
+      <div class="note-card">
+        <h3>交互行为对应表（点宽度自测）</h3>
+        <ul>
+          <li><b>≤899px</b>：会话列表 → 汉堡抽屉（带遮罩）；文件/终端/交付物 → 底部 sheet 上滑；出现底部 Tab（聊天/文件/终端/更多）；「更多」承接 设置/市场/任务/技能 等低频面。</li>
+          <li><b>≤639px</b>：消息满宽；模型/预设 pill 收进输入区；输入框 <span class="mono">16px</span>（防 iOS 聚焦放大）；按钮 44px 触控目标；审批卡全宽 + 双大按钮；市场两列卡片；长代码块限高滚动。</li>
+          <li><b>桌面 ≥900</b>：三栏原样，零改动 —— 适配层只在代理链路注入，桌面物理隔离。</li>
+        </ul>
+      </div>
+      <div class="note-card">
+        <h3>实现落点（与上一轮 v2 方案一致）</h3>
+        <ul>
+          <li>规则载体：<span class="mono">admin/mobile-skin.js</span> 静态 CSS，经 <span class="mono">reverse-proxy</span> 注入手机侧 HTML（同步改 content-length / 剥 etag / no-store）。</li>
+          <li>断点机制真机用 <span class="mono">@media (max-width:…)</span>（整页视口），本原型为演示用 <span class="mono">@container</span> 模拟 —— 规则集相同。</li>
+          <li>骨架锚点：侧栏/右栏/输入区用 DOM 形状 + <span class="mono">--dsw-*</span> token 覆盖，不用构建哈希类名；不命中即静默。</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  var $ = function (id) { return document.getElementById(id); };
+  var wrap = $('devwrap'), dev = $('dev'), app = $('app');
+  var stabs = $('stabs');
+
+  // —— 宽度控制 ——
+  var slider = $('w'), wr = $('wr');
+  function setWidth(w) {
+    w = Math.max(340, Math.min(1280, w));
+    wrap.style.width = w + 'px';
+    wr.textContent = w + 'px';
+    slider.value = w;
+    document.querySelectorAll('.preset').forEach(function (b) {
+      b.classList.toggle('on', Number(b.dataset.w) === w);
+    });
+    // 自动演示：手机宽度默认展开一次抽屉提示（仅注释态）
+  }
+  slider.addEventListener('input', function () { setWidth(Number(slider.value)); });
+  document.querySelectorAll('.preset').forEach(function (b) {
+    b.addEventListener('click', function () { setWidth(Number(b.dataset.w)); });
+  });
+  setWidth(1180);
+
+  // —— 抽屉 / 底部 sheet ——
+  var btnMenu = $('btn-menu'), btnRight = $('btn-right'), scrim = $('scrim'), grip = $('grip');
+  btnMenu.addEventListener('click', function () { app.classList.toggle('drawer-open'); });
+  scrim.addEventListener('click', function () { app.classList.remove('drawer-open'); app.classList.remove('sheet-open'); });
+  grip.addEventListener('click', function () { app.classList.remove('sheet-open'); });
+  btnRight.addEventListener('click', function () { app.classList.toggle('sheet-open'); });
+
+  // —— 右栏内部 tabs ——
+  var rtabs = document.querySelectorAll('.right .rtabs button');
+  rtabs.forEach(function (b) {
+    b.addEventListener('click', function () {
+      rtabs.forEach(function (x) { x.classList.toggle('on', x === b); });
+      document.querySelectorAll('.rpane').forEach(function (p) {
+        p.hidden = p.dataset.t !== b.dataset.t;
+      });
+    });
+  });
+
+  // —— 底部 tabs：聊天=回主区，文件/终端=打开 sheet 并选中，更多=打开设置页 ——
+  var btabs = document.querySelectorAll('#btabs button');
+  btabs.forEach(function (b) {
+    b.addEventListener('click', function () {
+      btabs.forEach(function (x) { x.classList.toggle('on', x === b); });
+      var k = b.dataset.b;
+      if (k === 'chat') {
+        app.classList.remove('sheet-open');
+        showSurface('chat');
+      } else if (k === 'more') {
+        app.classList.remove('sheet-open');
+        showSurface('settings');
+      } else {
+        showSurface(k === 'files' ? 'files' : 'terminal');
+        var t = k === 'files' ? 'files' : 'term';
+        rtabs.forEach(function (x) { x.classList.toggle('on', x.dataset.t === t); });
+        document.querySelectorAll('.rpane').forEach(function (p) { p.hidden = p.dataset.t !== t; });
+        app.classList.add('sheet-open');
+      }
+    });
+  });
+
+  // —— surface 切换 ——
+  var SURF_MAIN = { chat: 1, approval: 1, terminal: 1, files: 1, settings: 1, market: 1, jobs: 1 };
+  function showSurface(s) {
+    stabs.querySelectorAll('button').forEach(function (x) { x.classList.toggle('on', x.dataset.s === s); });
+    document.querySelectorAll('[data-surface]').forEach(function (p) {
+      if (p.dataset.surface === 'chat') { p.hidden = s !== 'chat'; }
+      else p.hidden = p.dataset.surface !== s;
+    });
+    // 页面态隐藏输入区（设置/市场/任务）
+    var pageLike = s === 'settings' || s === 'market' || s === 'jobs';
+    $('composer').style.display = pageLike ? 'none' : '';
+  }
+  stabs.querySelectorAll('button').forEach(function (b) {
+    b.addEventListener('click', function () {
+      app.classList.remove('sheet-open');
+      showSurface(b.dataset.s);
+    });
+  });
+
+  // —— 开关 ——
+  function toggleBtn(id, cls, target) {
+    var b = $(id);
+    b.addEventListener('click', function () {
+      b.classList.toggle('on');
+      if (target) target.classList.toggle(cls);
+    });
+  }
+  toggleBtn('tg-bezel', 'phone-bezel', dev);
+  toggleBtn('tg-safe', 'show-safe', dev);
+  toggleBtn('tg-notes', 'notes-on', document.body);
+
+  // —— 发送按钮可用性（示意） ——
+  var input = document.querySelector('.c-input'), send = $('send');
+  input.addEventListener('input', function () { send.classList.toggle('off', !input.value.trim()); });
+})();
+</script>
+</body>
+</html>

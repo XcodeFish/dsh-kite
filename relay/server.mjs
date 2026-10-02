@@ -163,6 +163,21 @@ function recordClose(peer, code, reason) {
 const connectors = new Map();
 /** deviceId → { connectorId, phones:Set<ws> } */
 const devices = new Map();
+/**
+ * connectorId → Set<deviceId>：连接器**权威上报**过的设备表（`devices` 帧）。
+ *
+ * ★ 2026-10-02 真机事故（界面「一直显示重新连接」）：devices 条目的生命周期一度被绑在
+ *   「这台手机此刻还有没有 socket 开着」上 —— 手机合盖/退后台/被杀，最后一条 socket
+ *   close 就把条目删掉（旧 907 行），而连接器只在**重连/配对完成**时才重报设备表
+ *   （transport/relay-client.js 的 publishDevices 三个调用点），于是该设备此后所有
+ *   **只带 ra-device cookie** 的请求全部失去路由键：
+ *     · 前端全部相对路径请求（/api/*、assets）→ 中继 401/503（走不到连接器）
+ *     · 不带 c 的 /api/remote.mux 实时通道 → 中继 4503 直接掐掉 → 界面永远「重新连接」
+ *   单连接器部署被「唯一连接器兜底」（connectorFor 的 connectors.size===1 分支）掩盖；
+ *   一旦中继上同时挂着 2 个连接器，兜底失效，症状就是刷新也没用的死锁。
+ *   本表是「条目该不该留」的唯一判据：连接器上报过的设备，条目必须常驻。
+ */
+const publishedDevices = new Map();
 /** 设备所有权冲突去重日志：deviceId:connectorId → 已告警过（防日志风暴）。 */
 const conflictLogged = new Set();
 /**
@@ -195,6 +210,34 @@ setInterval(() => {
     try { ws.ping(); } catch { /* readyState 竞态，下轮再判 */ }
   }
 }, CONNECTOR_PING_MS);
+
+// ---- 手机 socket 存活探测（keepalive）----
+// ★ 真机事故 2026-10-02（与 publishedDevices 同一条因果链的另一半）：手机「合盖/退后台/
+//   被系统杀掉/换网」时 socket 常常不送 FIN，中继这边 readyState 仍是 OPEN 的**幽灵**条目 ——
+//   它既占住 MAX_PHONE_PER_DEVICE 名额（攒够 4 条后，重新打开浏览器建 mux 一律被 4429
+//   「too many connections」挡回，界面永远「重新连接」），又让条目永不回收。
+//   与连接器同样周期 ping：一个周期内没见到 pong 即 terminate，走既有 close 清理。
+//   （ping/pong 是协议层自动应答，页面退到后台、JS 被冻结也会回；回不了 = 连接真的没了。）
+const _phonePingEnv = Number(process.env.RELAY_PHONE_PING_MS);
+const PHONE_PING_MS = Number.isFinite(_phonePingEnv) && _phonePingEnv >= 1000 ? _phonePingEnv : 60_000;
+const phoneAlive = new WeakMap(); // phone ws → 上个周期是否见到 pong
+setInterval(() => {
+  for (const entry of devices.values()) {
+    for (const ws of [...entry.phones]) {
+      if (ws.readyState !== 1) {
+        entry.phones.delete(ws); // 已死但 close 还没跑到：先让位，避免占名额
+        continue;
+      }
+      if (phoneAlive.get(ws) === false) {
+        console.log('[ra-relay] 手机 socket 无响应（一个 ping 周期未回 pong），剔除幽灵连接');
+        try { ws.terminate(); } catch { /* close 事件兜底 */ }
+        continue;
+      }
+      phoneAlive.set(ws, false);
+      try { ws.ping(); } catch { /* readyState 竞态，下轮再判 */ }
+    }
+  }
+}, PHONE_PING_MS);
 
 function rateLimit(ip) {
   const now = Date.now();
@@ -626,6 +669,7 @@ function onConnector(ws, url) {
   ws.on('close', (code, reason) => {
     recordClose('connector', code, reason);
     if (connectors.get(connectorId) === ws) connectors.delete(connectorId);
+    publishedDevices.delete(connectorId); // 该连接器的权威设备表随之下线（条目已在下面清掉）
     for (const [deviceId, entry] of [...devices]) {
       if (entry.connectorId === connectorId) {
         for (const phone of entry.phones) {
@@ -744,6 +788,8 @@ function relayConnectorFrame(connectorWs, frame) {
     const ids = Array.isArray(frame.deviceIds) ? frame.deviceIds : [];
     const connectorId = connectorIdOf(connectorWs);
     if (connectorId) {
+      // ★ 先登记「权威设备表」：条目该不该留以它为准（见 publishedDevices）。
+      publishedDevices.set(connectorId, new Set(ids.filter((id) => typeof id === 'string' && id.length > 0)));
       // 清理该连接器下已不再上报的设备
       for (const [deviceId, entry] of [...devices]) {
         if (entry.connectorId === connectorId && !ids.includes(deviceId) && entry.phones.size === 0) {
@@ -824,6 +870,8 @@ function onPhoneSocket(ws, url, req) {
     return;
   }
   entry.phones.add(ws);
+  phoneAlive.set(ws, true);
+  ws.on('pong', () => phoneAlive.set(ws, true));
 
   // 信令通道（/device?ch=）：pair/auth 帧按 channel 回路。
   if (url.pathname === '/device' && channel) {
@@ -904,7 +952,14 @@ function onPhoneSocket(ws, url, req) {
   ws.on('close', (code, reason) => {
     recordClose('phone', code, reason);
     entry.phones.delete(ws);
-    if (entry.phones.size === 0 && devices.get(claimedDeviceId) === entry) devices.delete(claimedDeviceId);
+    phoneAlive.set(ws, false);
+    if (entry.phones.size === 0 && devices.get(claimedDeviceId) === entry) {
+      // ★ 只回收「没有权威依据」的条目（未上报的 ad-hoc 声称、`d=` 临时 id）；
+      //   连接器上报过的设备条目必须留在表里 —— 否则手机一关，它自己就再也回不来，
+      //   见 publishedDevices 的说明（真机事故 2026-10-02：界面一直显示重新连接）。
+      const published = publishedDevices.get(entry.connectorId)?.has(claimedDeviceId) === true;
+      if (!published) devices.delete(claimedDeviceId);
+    }
     if (channel) {
       streams.delete(`ch:${channel}`);
       streams.delete(`pair:${channel}`);
