@@ -579,6 +579,23 @@ async function refresh() {
     $('dev-rows').innerHTML = s.devices.length ? s.devices.map((d) => '<tr><td>' + esc(d.name) + '</td><td class="mono">' + esc(d.deviceId) + '</td><td>' + new Date(d.pairedAt).toLocaleString() + '</td><td>' + (d.lastActiveAt ? new Date(d.lastActiveAt).toLocaleString() : '-') + '</td><td><button class="danger" onclick="revoke(\\'' + d.deviceId + '\\')">撤销</button></td></tr>').join('') : '<tr><td colspan="5" class="note">暂无设备</td></tr>';
     // 待配对：倒计时 + 桌面侧校验码（手机提交公钥后出现，用于两端比对）
     const pendingList = s.pairings || [];
+    // ★ 配对完成检测（真机反馈 2026-10-02：手机扫码成功后面板滞留「等待手机提交…」，
+    //   用户不知道已经成功）。信号 = 上一轮还有「已出校验码」的待配对条目，这一轮
+    //   消失了，且设备表出现了新条目 —— 即配对完成。显示成功态并折叠二维码区。
+    const codedNow = pendingList.find((p) => p.code);
+    if (codedNow) {
+      window.__pairWatch = { tokenMasked: codedNow.tokenMasked, code: codedNow.code };
+    } else if (window.__pairWatch && !$('pair-out').classList.contains('hidden')) {
+      // 条目消失了：确认设备表里出现了对应的新配对（pairedAt 在本轮询周期附近）
+      const newest = (s.devices || []).slice().sort((a, b) => b.pairedAt - a.pairedAt)[0];
+      if (newest && Date.now() - newest.pairedAt < 120000) {
+        $('pair-code').innerHTML = '<span style="color:#4ade80;font-weight:600">✓ 配对成功</span> · 设「' + esc(newest.name) + '」已加入（2 分钟内有效票据，过期自动重连）';
+        $('pair-pending').textContent = '';
+        // 3 秒后自动折叠二维码区，避免占屏
+        setTimeout(() => { try { $('pair-out').classList.add('hidden'); } catch { /* 已被刷新 */ } }, 3000);
+        window.__pairWatch = null;
+      }
+    }
     if (pendingList.length > 0 && !$('pair-out').classList.contains('hidden')) {
       const left = Math.max(0, Math.round((pendingList[0].expiresAt - Date.now()) / 1000));
       $('pair-countdown').textContent = left > 0 ? left + 's 后过期' : '已过期，请重新生成';
