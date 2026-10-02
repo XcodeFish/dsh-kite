@@ -38,6 +38,10 @@
 export const PROTO_VERSION = 1;
 /** 单帧 JSON 上限（字节）。 */
 export const MAX_FRAME_BYTES = 1024 * 1024;
+/** 二进制帧线上上限（中继 ws maxPayload 同此值 —— 头+原始载荷，不再受 1MiB JSON 限制）。 */
+export const MAX_WIRE_FRAME_BYTES = 16 * 1024 * 1024;
+/** JSON 头与原始载荷的分隔字节。 */
+const SEPARATOR = Buffer.from([0x00]);
 /** 单个请求/响应体分片上限（b64 前的字节数）。 */
 export const MAX_CHUNK_BYTES = 256 * 1024;
 
@@ -159,6 +163,67 @@ export function decodeFrame(text) {
   } catch {
     throw new FrameError('bad-json', 'frame is not valid JSON');
   }
+  return assertFrame(frame);
+}
+
+// ---- 二进制承载帧（协议 v1 扩展，caps 协商 'bin' 后启用）----
+//
+// 目的：大载荷帧（http-body / http-res-body / ws-data）不再走「b64 + JSON 文本」，
+// 而是 ws 二进制消息 = 「JSON 头 + 0x00 分隔 + 原始载荷字节」。
+//   收益：载荷零膨胀（v1 对压缩后字节仍有 +33%），且省 2×b64 与大字符串 JSON 字段
+//   兼容：控制帧/信令帧仍走 JSON 文本；对端 caps 无 'bin' 时自动回退全文本。
+//   中继不解码二进制帧语义 —— 头里的 deviceId/streamId 与 JSON 版完全一致，
+//   中继解析头后走同一条 relayConnectorFrame 路径。
+
+/** 可走二进制承载的 kind（载荷字段名 → 头里删除、放原始字节区）。 */
+const BIN_PAYLOAD_FIELD = {
+  'http-body': 'chunk',
+  'http-res-body': 'chunk',
+  'ws-data': 'data'
+};
+
+/** 判断一帧是否适合二进制承载（载荷足够大才值得 —— 小帧 JSON 更紧凑）。 */
+export function isBinEligible(frame, minPayload = 4096) {
+  if (!frame || typeof frame !== 'object') return false;
+  const field = BIN_PAYLOAD_FIELD[frame.kind];
+  if (!field) return false;
+  const v = frame[field];
+  if (typeof v !== 'string') return false;
+  // b64 长度 × 3/4 ≈ 原始字节；超过阈值才切二进制（小帧切过去反而多写一遍头）
+  return v.length >= Math.ceil(minPayload * 4 / 3);
+}
+
+/** 编码二进制帧：JSON 头（去掉载荷字段）+ 0x00 + 原始载荷。超限抛错。 */
+export function encodeBinFrame(frame) {
+  assertFrame(frame);
+  const field = BIN_PAYLOAD_FIELD[frame.kind];
+  if (!field) throw new FrameError('bad-frame', `${frame.kind}: not a binary-eligible kind`);
+  const payload = b64d(frame[field], field);
+  const head = { ...frame };
+  delete head[field];
+  const headText = JSON.stringify(head);
+  const headBuf = Buffer.from(headText, 'utf8');
+  const total = headBuf.length + 1 + payload.length;
+  if (total > MAX_WIRE_FRAME_BYTES) throw new FrameError('frame-too-large', `binary frame exceeds ${MAX_WIRE_FRAME_BYTES} bytes`);
+  return Buffer.concat([headBuf, SEPARATOR, payload]);
+}
+
+/** 解码二进制帧：与 encodeBinFrame 互逆。任何偏差抛 FrameError。 */
+export function decodeBinFrame(buf) {
+  if (!Buffer.isBuffer(buf)) throw new FrameError('bad-frame', 'binary frame must be a Buffer');
+  const at = buf.indexOf(SEPARATOR[0]);
+  if (at === -1 || at === 0 || at > 4096) throw new FrameError('bad-frame', 'binary frame: separator not found or head too large');
+  let frame;
+  try {
+    frame = JSON.parse(buf.subarray(0, at).toString('utf8'));
+  } catch {
+    throw new FrameError('bad-json', 'binary frame head is not valid JSON');
+  }
+  const field = BIN_PAYLOAD_FIELD[frame?.kind];
+  if (!field) throw new FrameError('unknown-kind', `binary frame has non-binary kind ${JSON.stringify(frame?.kind)}`);
+  // 头里必须没有载荷字段（防伪造 + exactKeys 干净）；载荷区即字段值
+  if (field in frame) throw new FrameError('bad-frame', `binary frame head must not carry "${field}"`);
+  frame[field] = buf.subarray(at + 1).toString('base64url');
   return assertFrame(frame);
 }
 

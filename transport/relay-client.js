@@ -7,7 +7,7 @@
  * - 职责：帧路由 + 设备会话状态 + 配对/鉴权帧处理；HTTP 转发核心在 reverse-proxy，
  *   WS 桥在 upgrade.js —— 本文件不碰 ctx.*（定时器安全纪律⑤）。
  */
-import { decodeFrame, encodeFrame, b64d, b64e, MAX_CHUNK_BYTES } from './frames.js';
+import { decodeFrame, encodeFrame, decodeBinFrame, encodeBinFrame, isBinEligible, b64d, b64e, MAX_CHUNK_BYTES } from './frames.js';
 import { deviceCookieFrom } from '../identity/pairing.js';
 import { newChallenge } from '../identity/ticket.js';
 import { forwardRequest } from '../proxy/reverse-proxy.js';
@@ -40,6 +40,7 @@ export class RelayConnector {
     httpRequests: 0, wsBridges: 0, framesDropped: 0, dropsByReason: {}
   };
   #sealedCounters = new Map(); // deviceId → CounterState（thin client E2E，M2 协议面）
+  #binNegotiated = false;      // 中继 hello-ack.caps 含 'bin' 后 true（二进制承载帧开关）
 
   constructor(deps) {
     // deps: { relayUrl, relayToken, connectorId, devices, tickets, pairing, policy, credential,
@@ -93,14 +94,20 @@ export class RelayConnector {
     return false;
   }
 
-  /** TransportAdapter.send（帧已过 encodeFrame 由这里统一把关）。 */
+  /** TransportAdapter.send（帧已过 encodeFrame/encodeBinFrame 由这里统一把关）。
+   *  ★ 协商过 caps 'bin' 且帧适合二进制承载（大载荷）时走 ws 二进制消息，
+   *    其余仍 JSON 文本 —— 对端不支持时自动全文本回退。 */
   send(frame) {
     if (!this.#ws || this.#ws.readyState !== 1) {
       // 以前这里是无条件的静默 `return false`，调用方普遍不检查 —— 帧就此消失。
       return this.#recordDrop('socket_not_open', { readyState: this.#ws?.readyState ?? null, kind: frame?.kind });
     }
     try {
-      this.#ws.send(encodeFrame(frame));
+      if (this.#binNegotiated && isBinEligible(frame)) {
+        this.#ws.send(encodeBinFrame(frame), { binary: true });
+      } else {
+        this.#ws.send(encodeFrame(frame));
+      }
       this.#metrics.framesOut += 1;
       return true;
     } catch (error) {
@@ -135,13 +142,17 @@ export class RelayConnector {
     if (this.#retryAttempt > 0) this.#metrics.reconnects += 1;
     ws.onopen = () => {
       // hello 在 open 后即发；relay 回 hello-ack 才算 established。
-      this.send({ kind: 'hello', proto: 1, caps: ['http', 'ws', 'pair', 'auth'], nonce: randomUUID() });
+      // caps 'bin'：宣告支持二进制承载帧（大载荷免 b64+JSON 膨胀）。
+      this.send({ kind: 'hello', proto: 1, caps: ['http', 'ws', 'pair', 'auth', 'bin'], nonce: randomUUID() });
     };
     ws.onmessage = (event) => {
       this.#metrics.framesIn += 1;
       let frame;
       try {
-        frame = decodeFrame(typeof event.data === 'string' ? event.data : Buffer.from(event.data).toString('utf8'));
+        // ★ 二进制消息 = 二进制承载帧（'bin' 协商后中继才可能发）；文本 = JSON 帧。
+        frame = typeof event.data === 'string'
+          ? decodeFrame(event.data)
+          : decodeBinFrame(Buffer.isBuffer(event.data) ? event.data : Buffer.from(event.data));
       } catch (error) {
         this.#deps.audit?.({ kind: 'relay.protocol-error', reason: error.message });
         this.#closeSocket(1002, 'protocol error');
@@ -194,8 +205,10 @@ export class RelayConnector {
         this.#retryAttempt = 0;
         this.#metrics.lastError = null; // 建立成功即清残留错误（面板不再显示历史抖动）
         this.#metrics.openedAt = Date.now();
+        // ★ 中继也在 caps 里宣告 'bin' 才启用二进制承载 —— 任一侧不支持都全文本回退。
+        this.#binNegotiated = Array.isArray(frame.caps) && frame.caps.includes('bin');
         this.publishDevices(); // ★ 上报已配对设备 → 中继据此路由普通 HTTP（含 PWA 页面）
-        this.#deps.logger?.info?.(`[kite] relay established (proto=${frame.proto})`);
+        this.#deps.logger?.info?.(`[kite] relay established (proto=${frame.proto} bin=${this.#binNegotiated ? 'on' : 'off'})`);
         return;
       }
       case 'ping':
@@ -604,7 +617,10 @@ export function probeRelay({ relayUrl, relayToken, timeoutMs = 10_000 } = {}) {
       ws.onmessage = (event) => {
         let frame;
         try {
-          frame = decodeFrame(typeof event.data === 'string' ? event.data : Buffer.from(event.data).toString('utf8'));
+          // 预检握手只收 hello-ack（JSON 文本帧），但按协议宽容解析二进制
+          frame = typeof event.data === 'string'
+            ? decodeFrame(event.data)
+            : decodeBinFrame(Buffer.isBuffer(event.data) ? event.data : Buffer.from(event.data));
         } catch {
           done({ ok: false, code: 'server', reason: '中继返回了无法解析的帧（部署的可能不是本中继）' });
           return;

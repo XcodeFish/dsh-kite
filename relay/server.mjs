@@ -27,6 +27,7 @@ import { readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import { gzipSync } from 'node:zlib';
+import { isBinEligible, encodeBinFrame, decodeBinFrame } from '../transport/frames.js';
 
 // 守护弹性：中继是可用性组件，未捕获异常/拒绝只记日志不退出（launchd KeepAlive 之外的二道防线）。
 process.on('uncaughtException', (err) => console.error('[ra-relay] uncaught:', err?.stack || err));
@@ -133,6 +134,7 @@ const connectRate = new Map();
 const _pingEnv = Number(process.env.RELAY_CONNECTOR_PING_MS);
 const CONNECTOR_PING_MS = Number.isFinite(_pingEnv) && _pingEnv >= 1000 ? _pingEnv : 30_000;
 const connectorAlive = new WeakMap(); // connector ws → 上个周期是否见到 pong
+const binCaps = new WeakSet();        // 已协商 caps 'bin' 的 socket（connector 或 phone）→ 可收发二进制承载帧
 setInterval(() => {
   for (const [id, ws] of connectors) {
     if (ws.readyState !== 1) continue;
@@ -171,6 +173,26 @@ function rateLimit(ip) {
 function send(ws, frame) {
   if (!ws || ws.readyState !== 1) {
     return recordDrop('socket_not_open', { readyState: ws?.readyState ?? null, kind: frame?.kind });
+  }
+  // ★ 二进制承载帧：该 socket 协商过 'bin' 且帧适合（大载荷）→ 免 b64+JSON 膨胀。
+  //   phone socket 与 connector socket 各自记录协商结果（binCaps WeakSet）。
+  if (binCaps.has(ws) && isBinEligible(frame)) {
+    let bin;
+    try {
+      bin = encodeBinFrame(frame);
+    } catch (error) {
+      return recordDrop('bin_encode_failed', { kind: frame?.kind, message: String(error?.message ?? error).slice(0, 120) });
+    }
+    noteFrame(bin.length);
+    if (bin.length > MAX_WIRE_FRAME_BYTES) {
+      return recordDrop('outbound_frame_too_large', { size: bin.length, limit: MAX_WIRE_FRAME_BYTES, kind: frame?.kind });
+    }
+    if (ws.bufferedAmount > MAX_SOCKET_BUFFER_BYTES) {
+      return recordDrop('socket_buffer_full', { bufferedAmount: ws.bufferedAmount, size: bin.length, kind: frame?.kind });
+    }
+    metrics.bytesRelayed += bin.length;
+    ws.send(bin, { binary: true });
+    return true;
   }
   const text = JSON.stringify(frame);
   const size = Buffer.byteLength(text);
@@ -512,7 +534,9 @@ function onConnector(ws, url) {
   for (const entry of devices.values()) {
     if (entry.connectorId === connectorId) entry.connectorId = connectorId; // 重连后路由已由 key 对齐
   }
-  send(ws, { kind: 'hello-ack', proto: 1, caps: ['http', 'ws', 'pair', 'auth'] });
+  // hello-ack 恒宣告 'bin'（中继单方面支持）。真正启用二进制承载的判据是
+  //   binCaps（连接器 hello 宣告过 bin 才登记）—— 双向各自的发送路径独立查表。
+  send(ws, { kind: 'hello-ack', proto: 1, caps: ['http', 'ws', 'pair', 'auth', 'bin'] });
 
   // ★ maxPayload === MAX_FRAME_BYTES，所以超大帧会在 ws 解析层就被拒并抛 error，
   //   根本走不到下面那句 data.length 检查（那句实际是死代码，保留作二道防线）。
@@ -527,18 +551,25 @@ function onConnector(ws, url) {
     });
   });
 
-  ws.on('message', (data) => {
+  ws.on('message', (data, isBinary) => {
     noteFrame(data.length);
-    if (data.length > MAX_FRAME_BYTES) {
-      recordDrop('inbound_frame_too_large', { dir: 'connector', size: data.length, limit: MAX_FRAME_BYTES });
+    const limit = isBinary ? MAX_WIRE_FRAME_BYTES : MAX_FRAME_BYTES;
+    if (data.length > limit) {
+      recordDrop('inbound_frame_too_large', { dir: 'connector', size: data.length, limit });
       return;
     }
     let frame;
     try {
-      frame = JSON.parse(data.toString('utf8'));
-    } catch {
-      recordDrop('bad_json', { dir: 'connector', size: data.length });
-      ws.close(1002, 'bad json');
+      // ★ 二进制消息 = 二进制承载帧（仅当该连接器协商过 'bin' 才可能合法出现）。
+      if (isBinary) {
+        if (!binCaps.has(ws)) return recordDrop('bin_frame_unnegotiated', { dir: 'connector', size: data.length });
+        frame = decodeBinFrame(data);
+      } else {
+        frame = JSON.parse(data.toString('utf8'));
+      }
+    } catch (error) {
+      recordDrop(isBinary ? 'bad_bin_frame' : 'bad_json', { dir: 'connector', size: data.length, message: String(error?.message ?? '').slice(0, 120) });
+      ws.close(1002, isBinary ? 'bad binary frame' : 'bad json');
       return;
     }
     relayConnectorFrame(ws, frame);
@@ -691,7 +722,12 @@ function relayConnectorFrame(connectorWs, frame) {
     }
     return;
   }
-  // hello / ping / pong / 未知帧：中继不裁定协议，静默计数。
+  if (kind === 'hello') {
+    // ★ caps 'bin' 协商：连接器宣告且中继支持 → 双向启用二进制承载帧。
+    if (Array.isArray(frame.caps) && frame.caps.includes('bin')) binCaps.add(connectorWs);
+    return;
+  }
+  // ping / pong / 未知帧：中继不裁定协议，静默计数。
 }
 
 function onPhoneSocket(ws, url, req) {
@@ -786,6 +822,8 @@ function onPhoneSocket(ws, url, req) {
 
   ws.on('message', (data, isBinary) => {
     // /device 信令帧：opaque 直通（pair-begin/auth-begin/sealed 等）。
+    // ★ 保持 JSON 文本-only：信令帧小且字段杂，二进制无收益；PWA 配对页/未来 thin
+    //   client 均未实现 bin 编码，此处若放开会破坏兼容（bin 协商只覆盖 connector 面）。
     if (url.pathname !== '/device') return; // 非信令路径由上面那条 handler 处理，不是丢帧
     if (isBinary) return recordDrop('device_binary_frame', { size: data.length, channel });
     noteFrame(data.length);

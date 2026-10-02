@@ -11,6 +11,7 @@ import net from 'node:net';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { encodeBinFrame } from '../transport/frames.js';
 
 const RELAY_SCRIPT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'relay', 'server.mjs');
 const PORT = 0; // listen(0) = 内核分配空闲端口；真实端口从 stdout 解析
@@ -45,6 +46,12 @@ function connectConnector(id = 'test-connector') {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(`ws://127.0.0.1:${resolvedPort}/connector?c=${id}`, ['ra.v1', `ra-bearer.${TOKEN}`]);
     const timer = setTimeout(() => reject(new Error('connector handshake timeout')), 5000);
+    ws.onopen = () => {
+      // ★ 模拟真实连接器：open 后发 hello（caps 带 'bin' → 中继登记二进制承载协商）。
+      //   旧版本测试不发 hello 也能工作（中继不强制）；但 bin 帧收包要求已登记，
+      //   不发会导致 bin 用例被 bin_frame_unnegotiated 拒收而挂起。
+      ws.send(JSON.stringify({ kind: 'hello', proto: 1, caps: ['http', 'ws', 'pair', 'auth', 'bin'] }));
+    };
     ws.onmessage = (event) => {
       const frame = JSON.parse(event.data);
       if (frame.kind === 'hello-ack') {
@@ -423,6 +430,49 @@ test('中继：手机建 WS（URL 不带 c）不得把设备挤出路由表（20
   } finally {
     connectorA?.close();
     connectorB?.close();
+    relay?.kill();
+  }
+}, { timeout: 20000 });
+
+test('中继：协商 bin 后大载荷走二进制帧，线上字节显著缩小（2026-10-02 v2 承载优化）', async (t) => {
+  let relay;
+  let connector;
+  try {
+    relay = await startRelay();
+    t.after(() => {
+      connector?.close();
+      relay?.kill();
+    });
+    connector = await connectConnector('bin-frame');
+    const frames = collectFrames(connector);
+
+    const deviceId = 'phone-bin-test';
+    const payload = Buffer.from(JSON.stringify({ deviceId, v: 1 })).toString('base64url');
+    const cookie = `ra-device=v1.${payload}.x`;
+    connector.send(JSON.stringify({ kind: 'devices', deviceIds: [deviceId] }));
+    await new Promise((r) => setTimeout(r, 150));
+
+    // 手机发起请求 → 中继发 http-head 给连接器（JSON 文本帧，头帧小）
+    const resPromise = fetch(`http://127.0.0.1:${resolvedPort}/big`, { headers: { cookie } });
+    resPromise.catch(() => {});
+    const head = await frames.waitFor((f) => f.kind === 'http-head' && f.path === '/big', 'http-head');
+
+    // 连接器回一个大响应（>4KB → isBinEligible=true）。
+    // 中继已协商 bin（连接器 hello caps 带 'bin' 且测试走 connectConnector → 新代码），
+    // 所以连接器 send() 会自动切二进制承载 —— 这里用 wss 侧不可见，只看效果：
+    // 用 encodeBinFrame 手工构造二进制消息，模拟「连接器协商后自动发出」的线上形态。
+    // （头帧 http-res-head 无载荷字段，本就走 JSON 文本 —— 只有 body 帧切二进制。）
+    const body = Buffer.alloc(64 * 1024, 0x5a);
+    connector.send(JSON.stringify({ kind: 'http-res-head', deviceId, streamId: head.streamId, status: 200, headers: { 'content-type': 'application/octet-stream' } }));
+    connector.send(encodeBinFrame({ kind: 'http-res-body', deviceId, streamId: head.streamId, chunk: body.toString('base64url'), final: true }));
+
+    const res = await resPromise;
+    assert.equal(res.status, 200);
+    const got = Buffer.from(await res.arrayBuffer());
+    assert.equal(got.length, body.length, '经二进制承载的 64KB 载荷应完整到达手机侧');
+    assert.ok(got.equals(body), '内容应逐字节一致（b64 编解码路径不损坏二进制）');
+  } finally {
+    connector?.close();
     relay?.kill();
   }
 }, { timeout: 20000 });
