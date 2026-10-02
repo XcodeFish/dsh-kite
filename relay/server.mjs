@@ -163,6 +163,8 @@ function recordClose(peer, code, reason) {
 const connectors = new Map();
 /** deviceId → { connectorId, phones:Set<ws> } */
 const devices = new Map();
+/** 设备所有权冲突去重日志：deviceId:connectorId → 已告警过（防日志风暴）。 */
+const conflictLogged = new Set();
 /**
  * streamId → 挂起会话：{ res? , phone?, timer?, connectorId }
  * 另有两个信令键：`pair:<channel>` 与 `ch:<channel>` → { phone }
@@ -751,8 +753,23 @@ function relayConnectorFrame(connectorWs, frame) {
       for (const deviceId of ids) {
         if (typeof deviceId !== 'string' || deviceId.length === 0) continue;
         const existing = devices.get(deviceId);
-        if (existing) existing.connectorId = connectorId;
-        else devices.set(deviceId, { connectorId, phones: new Set() });
+        if (existing) {
+          // ★ 所有权保护：设备已被【另一个】连接器上报时，后到者不得抢注。
+          //   真机事故 2026-10-02：本机新旧两套数据目录（default/desktop）各有一个
+          //   连接器同 token 连同一中继，desktop(4b94…) 的覆盖式上报会周期性把
+          //   default(0cb0…) 名下的设备抢走 → 手机 WS/资源瞬间 4503 →「重新连接中」
+          //   无限循环；几分钟内路由表在两个连接器之间反复横跳。
+          //   正当重连（同 connectorId）不受影响；真正的设备迁移由面板撤销+重新配对走 kick。
+          if (existing.connectorId !== connectorId) {
+            if (existing.phones.size > 0 || !conflictLogged.has(deviceId + ':' + connectorId)) {
+              console.log(`[ra-relay] 设备所有权冲突：deviceId=${deviceId.slice(0, 12)} 已归属 ${existing.connectorId.slice(0, 8)}，拒绝 ${connectorId.slice(0, 8)} 的抢注`);
+              conflictLogged.add(deviceId + ':' + connectorId);
+            }
+            continue;
+          }
+        } else {
+          devices.set(deviceId, { connectorId, phones: new Set() });
+        }
       }
       console.log(`[ra-relay] 设备路由表更新：connector=${connectorId.slice(0, 8)} devices=${ids.length}`);
     }
