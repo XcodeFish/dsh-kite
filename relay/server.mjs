@@ -754,19 +754,17 @@ function relayConnectorFrame(connectorWs, frame) {
         if (typeof deviceId !== 'string' || deviceId.length === 0) continue;
         const existing = devices.get(deviceId);
         if (existing) {
-          // ★ 所有权保护：设备已被【另一个】连接器上报时，后到者不得抢注。
-          //   真机事故 2026-10-02：本机新旧两套数据目录（default/desktop）各有一个
-          //   连接器同 token 连同一中继，desktop(4b94…) 的覆盖式上报会周期性把
-          //   default(0cb0…) 名下的设备抢走 → 手机 WS/资源瞬间 4503 →「重新连接中」
-          //   无限循环；几分钟内路由表在两个连接器之间反复横跳。
-          //   正当重连（同 connectorId）不受影响；真正的设备迁移由面板撤销+重新配对走 kick。
-          if (existing.connectorId !== connectorId) {
-            if (existing.phones.size > 0 || !conflictLogged.has(deviceId + ':' + connectorId)) {
-              console.log(`[ra-relay] 设备所有权冲突：deviceId=${deviceId.slice(0, 12)} 已归属 ${existing.connectorId.slice(0, 8)}，拒绝 ${connectorId.slice(0, 8)} 的抢注`);
-              conflictLogged.add(deviceId + ':' + connectorId);
-            }
-            continue;
+          // ★ 同一 deviceId 出现在两个连接器的上报里 = 配置错误（两套数据目录/两台
+          //   机器共用 token）。中继无法验证谁是真身（token 相同），这里保持
+          //   【最后上报者赢】并打冲突日志（真机事故 2026-10-02：曾尝试「后到者
+          //   拒绝」的所有权保护，结果 phantom 先上报时把正当连接器永久锁在外面，
+          //   比摇摆更糟 —— 已回滚）。真正的解是消灭多余连接器：同一 token 只该
+          //   有一台机器跑连接器；手机侧 4503 的验票失败会自然兜底，不泄露。
+          if (existing.connectorId !== connectorId && !conflictLogged.has(deviceId + ':' + connectorId)) {
+            console.log(`[ra-relay] 设备路由冲突：deviceId=${deviceId.slice(0, 12)} 由 ${existing.connectorId.slice(0, 8)} 改归 ${connectorId.slice(0, 8)}（多个连接器上报同一设备 —— 检查是否有别的机器在跑本插件）`);
+            conflictLogged.add(deviceId + ':' + connectorId);
           }
+          existing.connectorId = connectorId;
         } else {
           devices.set(deviceId, { connectorId, phones: new Set() });
         }
