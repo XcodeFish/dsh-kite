@@ -27,7 +27,53 @@ import { readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import { gzipSync } from 'node:zlib';
-import { isBinEligible, encodeBinFrame, decodeBinFrame } from '../transport/frames.js';
+
+// ---- 二进制承载帧编解码（与 transport/frames.js 保持协议一致的内联副本）----
+// ★ 刻意内联而非 import：中继的部署纪律是「自包含单文件」（build-bundle 只带
+//   server.mjs + ws 依赖，/opt/ra-relay 下没有 ../transport/）。2026-10-02 事故：
+//   一度写成 import '../transport/frames.js'，服务器上解析成 /opt/transport/… 直接
+//   ERR_MODULE_NOT_FOUND 循环崩溃。改动协议时两边必须同步改 —— 测试
+//   test/bin-frames.test.mjs + relay.integration.test.mjs 会同时覆盖两侧。
+const BIN_SEPARATOR = 0x00;
+const BIN_PAYLOAD_FIELD = {
+  'http-body': 'chunk',
+  'http-res-body': 'chunk',
+  'ws-data': 'data'
+};
+class FrameError extends Error {
+  constructor(code, message) { super(message); this.code = code; }
+}
+function isBinEligible(frame, minPayload = 4096) {
+  if (!frame || typeof frame !== 'object') return false;
+  const field = BIN_PAYLOAD_FIELD[frame.kind];
+  if (!field) return false;
+  const v = frame[field];
+  return typeof v === 'string' && v.length >= Math.ceil(minPayload * 4 / 3);
+}
+function encodeBinFrame(frame) {
+  const field = BIN_PAYLOAD_FIELD[frame.kind];
+  if (!field) throw new FrameError('bad-frame', `${frame.kind}: not a binary-eligible kind`);
+  const payload = Buffer.from(frame[field], 'base64url');
+  const head = { ...frame };
+  delete head[field];
+  return Buffer.concat([Buffer.from(JSON.stringify(head), 'utf8'), Buffer.from([BIN_SEPARATOR]), payload]);
+}
+function decodeBinFrame(buf) {
+  if (!Buffer.isBuffer(buf)) throw new FrameError('bad-frame', 'binary frame must be a Buffer');
+  const at = buf.indexOf(BIN_SEPARATOR);
+  if (at === -1 || at === 0 || at > 4096) throw new FrameError('bad-frame', 'binary frame: separator not found or head too large');
+  let frame;
+  try {
+    frame = JSON.parse(buf.subarray(0, at).toString('utf8'));
+  } catch {
+    throw new FrameError('bad-json', 'binary frame head is not valid JSON');
+  }
+  const field = BIN_PAYLOAD_FIELD[frame?.kind];
+  if (!field) throw new FrameError('unknown-kind', `binary frame has non-binary kind ${JSON.stringify(frame?.kind)}`);
+  if (field in frame) throw new FrameError('bad-frame', `binary frame head must not carry "${field}"`);
+  frame[field] = buf.subarray(at + 1).toString('base64url');
+  return frame;
+}
 
 // 守护弹性：中继是可用性组件，未捕获异常/拒绝只记日志不退出（launchd KeepAlive 之外的二道防线）。
 process.on('uncaughtException', (err) => console.error('[ra-relay] uncaught:', err?.stack || err));
