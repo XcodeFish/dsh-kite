@@ -857,6 +857,27 @@ function onPhoneSocket(ws, url, req) {
   const claimedDeviceId = url.searchParams.get('d') ?? routeHintFromCookie(req.headers.cookie) ?? `pair-${randomUUID().slice(0, 8)}`;
   const channel = url.searchParams.get('ch');
   const connector = routed.ws;
+
+  // ★ 认证收紧（2026-10-02 审查 P0-3）：?d= 与 ?c= 都是未认证的 URL 参数，旧逻辑
+  //   允许任意公网客户端借一个在线 connectorId 改写【已发布设备】的路由（实测
+  //   route-hijack.probe.mjs：无需 token、无需签名即可实时劫持 + 断连删条目）。
+  //   收紧后：真实设备条目（任一连接器权威上报过）只能由「归属连接器自身」的
+  //   连接建立来登记/触碰；别人的设备一律不写表 —— 该 socket 若真持有效票据，
+  //   连接器侧验票后由 ws-data/ws-open 正常桥接，不受影响；若没有，本就进不来。
+  //   pair-<random> 临时条目（配对信令）与未发布设备维持原语义。
+  const publishedOwner = (() => {
+    for (const [connId, set] of publishedDevices) {
+      if (set.has(claimedDeviceId)) return connId;
+    }
+    return null;
+  })();
+  if (publishedOwner && publishedOwner !== connectorId) {
+    console.log(`[ra-relay] 拒绝未认证路由改写：deviceId=${claimedDeviceId.slice(0, 12)} 属 ${publishedOwner.slice(0, 8)}，来路连接器=${String(connectorId).slice(0, 8)}`);
+    recordDrop('route_hijack_blocked', { deviceId: claimedDeviceId.slice(0, 12), owner: publishedOwner.slice(0, 8), via: String(connectorId).slice(0, 8) });
+    ws.close(4403, 'device belongs to another connector');
+    return;
+  }
+
   let entry = devices.get(claimedDeviceId);
   if (!entry || entry.connectorId !== connectorId) {
     // 新设备或换连接器（换机/重连到另一实例）：重建登记。
