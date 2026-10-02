@@ -101,6 +101,15 @@ const SPECS = {
   'auth-done': { channel: ['string', true], sig: ['string', true], ts: ['number', true] },
   'auth-result': { channel: ['string', true], ok: ['boolean', true], error: ['string', false], ticket: ['string', false], setCookie: ['string', false] },
 
+  /**
+   * Pair-Proof（2026-10-02）：连接器 → 中继。配对完成后把「设备归属」的
+   * 密码学凭证原件交给中继。sig = 手机私钥签名(challenge ‖ connectorId ‖ ts)，
+   * 其中 connectorId 必须等于发送者自身 —— 中继验签通过即把 deviceId 的路由
+   * 所有权绑定给该连接器（持久化），此后所有 devices 帧对他人 owned 的设备
+   * 不再生效。这是把「归属」从部署声明升格为密码学事实的唯一通道。
+   */
+  'device-claim': { deviceId: ['string', true], pubKey: ['string', true], challenge: ['string', true], sig: ['string', true], ts: ['number', true] },
+
   sealed: { deviceId: ['string', true], counter: ['number', true], nonce: ['string', true], ciphertext: ['string', true] },
 
   // E2E 明文内层

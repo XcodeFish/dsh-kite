@@ -394,9 +394,13 @@ export function createPairPageHandler(deps) {
     }
     if (action === 'complete') {
       const result = deps.pairing.complete({ challenge: payload.challenge, sig: payload.sig, ts: payload.ts });
+      // ★ Pair-Proof：result.claim（配对凭证原件）由 handlePairPage 的调用方
+      //   （relay-client HTTP 保留路径）读取并转发 device-claim 给中继。
+      //   不进 HTTP 响应体 —— 验签材料无需暴露给手机端页面。
       return {
         status: 200,
         headers: { 'content-type': 'application/json; charset=utf-8', 'set-cookie': result.setCookie },
+        claim: result.claim ?? null,
         body: Buffer.from(JSON.stringify({ ok: true, deviceId: result.deviceId, code: result.code }), 'utf8')
       };
     }

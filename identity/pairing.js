@@ -121,7 +121,17 @@ export function createPairingService({ keys, tickets, devices, ttlMs, logger, au
       const ticket = tickets.issue(session.deviceId);
       audit?.({ kind: 'pair.success', deviceId: session.deviceId, detail: { name: device.name } });
       pending.delete(session.token);
-      return { deviceId: session.deviceId, ticket, code: session.code, setCookie: deviceCookie('ra-device', ticket, 12 * 3600, secureCookies) };
+      // ★ claim 凭证原件：手机私钥对 (challenge ‖ connectorId ‖ ts) 的签名 ——
+      //   配对那一刻「该设备属于本连接器」的密码学事实。连接器应把它转交中继
+      //   （device-claim 帧），中继验签后持久化归属（Pair-Proof，2026-10-02）。
+      //   challenge 原样带上（b64url 字符串），中继无需解析即可复验绑定关系。
+      return {
+        deviceId: session.deviceId,
+        ticket,
+        code: session.code,
+        setCookie: deviceCookie('ra-device', ticket, 12 * 3600, secureCookies),
+        claim: { deviceId: session.deviceId, pubKey: device.pubKey, sig, ts, challenge }
+      };
     },
 
     /** 销毁全部未完成配对（kill switch）。 */

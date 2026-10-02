@@ -41,6 +41,7 @@ export class RelayConnector {
   };
   #sealedCounters = new Map(); // deviceId → CounterState（thin client E2E，M2 协议面）
   #binNegotiated = false;      // 中继 hello-ack.caps 含 'bin' 后 true（二进制承载帧开关）
+  #claimNegotiated = false;    // 中继 hello-ack.caps 含 'claim' 后 true（Pair-Proof 开关）
 
   constructor(deps) {
     // deps: { relayUrl, relayToken, connectorId, devices, tickets, pairing, policy, credential,
@@ -207,8 +208,11 @@ export class RelayConnector {
         this.#metrics.openedAt = Date.now();
         // ★ 中继也在 caps 里宣告 'bin' 才启用二进制承载 —— 任一侧不支持都全文本回退。
         this.#binNegotiated = Array.isArray(frame.caps) && frame.caps.includes('bin');
+        // Pair-Proof: 'claim' 宣告中继支持 device-claim 帧验签（旧中继没有此帧，
+        //   盲发会因 unknown-kind 被 1002 断连 —— 必须协商后发）。
+        this.#claimNegotiated = Array.isArray(frame.caps) && frame.caps.includes('claim');
         this.publishDevices(); // ★ 上报已配对设备 → 中继据此路由普通 HTTP（含 PWA 页面）
-        this.#deps.logger?.info?.(`[kite] relay established (proto=${frame.proto} bin=${this.#binNegotiated ? 'on' : 'off'})`);
+        this.#deps.logger?.info?.(`[kite] relay established (proto=${frame.proto} bin=${this.#binNegotiated ? 'on' : 'off'} claim=${this.#claimNegotiated ? 'on' : 'off'})`);
         return;
       }
       case 'ping':
@@ -349,7 +353,24 @@ export class RelayConnector {
           //   plugins / HTML did not preload」。等连接器下次重连才自愈。
           //   这里按路径判定「本次是否完成了配对」，完成则立刻上报。
           const isPairComplete = stream.path.startsWith('/kite/pair/complete') && res.status === 200;
-          if (isPairComplete) this.publishDevices();
+          if (isPairComplete) {
+            // ★ Pair-Proof：把配对凭证原件交给中继验签 —— 归属从「声明」升格为
+            //   「密码学事实」（phantom 无手机私钥，永远无法对自身 connectorId 产生
+            //   合法 claim）。claim 失败不影响配对本身（中继侧兼容旧语义）。
+            if (res.claim && this.#claimNegotiated) {
+              if (!this.send({
+                kind: 'device-claim',
+                deviceId: res.claim.deviceId,
+                pubKey: res.claim.pubKey,
+                challenge: res.claim.challenge,
+                sig: res.claim.sig,
+                ts: res.claim.ts
+              })) {
+                this.#deps.logger?.warn?.('[kite] device-claim 发送失败（连接器未连接）—— 将随下次重连上报重试');
+              }
+            }
+            this.publishDevices();
+          }
           this.#sendHttpResponse(stream.deviceId, streamId, res, stream);
           return;
         }
@@ -485,6 +506,17 @@ export class RelayConnector {
       //   下次重连前必然不在中继路由表里，welcome 之后的 / 只能靠中继兜底抽奖路由
       //   （真机事故 2026-10-01：多连接器时被投进错误/僵尸连接器，手机卡死在
       //   「配对完成，正在进入 DSH…」）。
+      //   Pair-Proof：信令通道的配对同样发 device-claim（与 HTTP 路径一致）。
+      if (result.claim && this.#claimNegotiated) {
+        this.send({
+          kind: 'device-claim',
+          deviceId: result.claim.deviceId,
+          pubKey: result.claim.pubKey,
+          challenge: result.claim.challenge,
+          sig: result.claim.sig,
+          ts: result.claim.ts
+        });
+      }
       this.publishDevices();
     } catch (error) {
       this.send({ kind: 'pair-result', channel: frame.channel, ok: false, error: error.message });

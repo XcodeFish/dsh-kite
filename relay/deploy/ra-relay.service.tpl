@@ -14,6 +14,8 @@ User=ra-relay
 Group=ra-relay
 WorkingDirectory=@RELAY_DIR@
 EnvironmentFile=@ENV_FILE@
+Environment=OWNER_STATE_DIR=/var/lib/ra-relay
+StateDirectory=ra-relay
 ExecStart=@NODE@ @RELAY_DIR@/server.mjs
 
 Restart=always
@@ -25,7 +27,9 @@ StandardError=journal
 SyslogIdentifier=ra-relay
 
 # --- 最小权限硬化 -----------------------------------------------------------
-# 中继是无状态转发组件（不落盘、不读用户数据、不做信任判断），所以可以锁得很紧。
+# 中继是轻状态转发组件：唯一落盘是 owners.json（Pair-Proof 设备归属表），
+# 通过 StateDirectory=ra-relay 拿到 /var/lib/ra-relay 的专用写权限 —— 不开
+# ReadWritePaths 大门，不让它接触任何用户数据。不做信任判断之外的安全职责。
 # 注意：刻意不启用 MemoryDenyWriteExecute —— 它会打断 V8 的 JIT。
 NoNewPrivileges=true
 PrivateTmp=true

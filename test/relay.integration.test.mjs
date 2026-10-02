@@ -520,3 +520,129 @@ test('中继：设备路由冲突可观测 —— 跨连接器上报同一设备
     relay?.kill();
   }
 }, { timeout: 20000 });
+
+// ---- Pair-Proof（设备归属密码学绑定）----
+import { generateKeyPairSync, sign as edSign, createHash } from 'node:crypto';
+
+/** 模拟手机端：生成设备密钥并产生 claim（签名串与 admin/panel.js 完全一致：ASCII 拼接）。 */
+function makeDevice(connectorId) {
+  const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+  const pubRaw = publicKey.export({ type: 'spki', format: 'der' }).subarray(-32);
+  const deviceId = Buffer.from(createHash('sha256').update(pubRaw).digest()).toString('base64url').slice(0, 22);
+  const pubB64 = pubRaw.toString('base64url');
+  const challenge = Buffer.from('challenge-' + Math.random().toString(36).slice(2)).toString('base64url');
+  const ts = Date.now();
+  const msg = new TextEncoder().encode(challenge + connectorId + String(ts));
+  const sig = Buffer.from(edSign(null, msg, privateKey)).toString('base64url');
+  return { deviceId, pubKey: pubB64, challenge, sig, ts };
+}
+
+test('Pair-Proof: 合法 claim 绑定归属 —— 他人 devices 帧抢注被拒（2026-10-02 根治）', async (t) => {
+  let relay, connectorA, connectorB;
+  try {
+    relay = await startRelay();
+    t.after(() => { connectorA?.close(); connectorB?.close(); relay?.kill(); });
+    connectorA = await connectConnector('owner-real');
+    connectorB = await connectConnector('phantom-conn');
+
+    // 手机在 A（owner-real）上配对 → 产生对 A 的 claim → 连接器转发
+    const dev = makeDevice('owner-real');
+    connectorA.send(JSON.stringify({ kind: 'device-claim', ...dev }));
+    await new Promise((r) => setTimeout(r, 200));
+
+    // A 上报该设备 → 登记
+    connectorA.send(JSON.stringify({ kind: 'devices', deviceIds: [dev.deviceId] }));
+    await new Promise((r) => setTimeout(r, 150));
+
+    // B（phantom）上报同一设备 → owners 表在 → 必须被忽略
+    connectorB.send(JSON.stringify({ kind: 'devices', deviceIds: [dev.deviceId] }));
+    await new Promise((r) => setTimeout(r, 150));
+
+    // 验证: cookie 路由仍走 A
+    const framesA = collectFrames(connectorA);
+    const cookie = `ra-device=v1.${Buffer.from(JSON.stringify({ deviceId: dev.deviceId, v: 1 })).toString('base64url')}.x`;
+    const replyPromise = fetch(`http://127.0.0.1:${resolvedPort}/pairproof-probe`, { headers: { cookie } });
+    replyPromise.catch(() => {});
+    const head = await framesA.waitFor((f) => f.kind === 'http-head' && f.path === '/pairproof-probe', 'claim 后路由应仍归 A');
+    assert.equal(head.deviceId, dev.deviceId, 'Pair-Proof：有合法 claim 的设备路由必须保持归属');
+
+    connectorA.send(JSON.stringify({ kind: 'http-res-head', deviceId: head.deviceId, streamId: head.streamId, status: 200, headers: { 'content-type': 'text/plain' } }));
+    connectorA.send(JSON.stringify({ kind: 'http-res-body', deviceId: head.deviceId, streamId: head.streamId, chunk: Buffer.from('ok').toString('base64url'), final: true }));
+    const res = await replyPromise;
+    assert.equal(res.status, 200);
+  } finally { connectorA?.close(); connectorB?.close(); relay?.kill(); }
+}, { timeout: 20000 });
+
+test('Pair-Proof: 伪造 claim（错公钥/错签名）被拒，不产生归属', async (t) => {
+  let relay, connector, connectorFake;
+  try {
+    relay = await startRelay();
+    t.after(() => { connector?.close(); connectorFake?.close(); relay?.kill(); });
+    connector = await connectConnector('owner-x');
+    connectorFake = await connectConnector('fake-conn');
+
+    // 伪造者的设备（自己的密钥）+ 对自己的签名 —— 但 deviceId 声称是受害者 A 的设备 id
+    const victimDev = makeDevice('owner-x');        // 真正的受害设备
+    connector.send(JSON.stringify({ kind: 'devices', deviceIds: [victimDev.deviceId] }));
+    await new Promise((r) => setTimeout(r, 150));
+
+    // 伪造 claim：pubKey/sig 都是假的，deviceId 声称为 victim 的
+    const fake = makeDevice('fake-conn');           // 伪造者自己的密钥对
+    connectorFake.send(JSON.stringify({ kind: 'device-claim', deviceId: victimDev.deviceId, pubKey: fake.pubKey, challenge: fake.challenge, sig: fake.sig, ts: fake.ts }));
+    await new Promise((r) => setTimeout(r, 200));
+
+    // sha256(fake.pubKey) ≠ victim deviceId → claim_id_mismatch → 无归属写入。
+    // 之后 owner-x 重报自己的设备表 → 在无 claim 旧语义下（最后上报者赢）拿回路由 ——
+    // 这正是「伪造 claim 没能锁死归属」的可观测结果（若 claim 伪造成功建立了归属，
+    // owner-x 的 devices 帧会被忽略，路由永远到不了 owner-x）。
+    connectorFake.send(JSON.stringify({ kind: 'devices', deviceIds: [victimDev.deviceId] }));
+    await new Promise((r) => setTimeout(r, 150));
+    connector.send(JSON.stringify({ kind: 'devices', deviceIds: [victimDev.deviceId] }));
+    await new Promise((r) => setTimeout(r, 150));
+
+    const framesOwner = collectFrames(connector);
+    const cookie = `ra-device=v1.${Buffer.from(JSON.stringify({ deviceId: victimDev.deviceId, v: 1 })).toString('base64url')}.x`;
+    const replyPromise = fetch(`http://127.0.0.1:${resolvedPort}/fake-claim-probe`, { headers: { cookie } });
+    replyPromise.catch(() => {});
+    const head = await framesOwner.waitFor((f) => f.kind === 'http-head' && f.path === '/fake-claim-probe', '伪造 claim 不应改变归属');
+    assert.equal(head.deviceId, victimDev.deviceId, '伪造 claim 不能抢走设备');
+
+    connector.send(JSON.stringify({ kind: 'http-res-head', deviceId: head.deviceId, streamId: head.streamId, status: 200, headers: { 'content-type': 'text/plain' } }));
+    connector.send(JSON.stringify({ kind: 'http-res-body', deviceId: head.deviceId, streamId: head.streamId, chunk: Buffer.from('ok').toString('base64url'), final: true }));
+    await replyPromise;
+  } finally { connector?.close(); connectorFake?.close(); relay?.kill(); }
+}, { timeout: 20000 });
+
+test('Pair-Proof: claim 绑定 connectorId —— 对 A 签的凭证发给 B 验不过（防重放换主）', async (t) => {
+  let relay, connectorA, connectorB;
+  try {
+    relay = await startRelay();
+    t.after(() => { connectorA?.close(); connectorB?.close(); relay?.kill(); });
+    connectorA = await connectConnector('conn-A');
+    connectorB = await connectConnector('conn-B');
+
+    // 手机在 A 配对 → claim 绑定 A 的 fingerprint
+    const dev = makeDevice('conn-A');
+    // 攻击者把 A 的 claim 原件转发给 B（replay）→ B 验签时 connectorId=B ≠ 签名里的 A → 验签失败
+    connectorB.send(JSON.stringify({ kind: 'device-claim', ...dev }));
+    await new Promise((r) => setTimeout(r, 200));
+
+    // B 上报该设备 → 无有效归属（claim 验签失败）→ 走无 claim 旧语义：归 B
+    // 但 A 随后上报同设备 → 无 claim 下最后上报者赢 → 归 A；且 A 若有自己合法 claim 则永久归 A
+    connectorA.send(JSON.stringify({ kind: 'device-claim', ...dev }));   // A 的合法 claim（challenge 对 A 签的）
+    await new Promise((r) => setTimeout(r, 200));
+    connectorA.send(JSON.stringify({ kind: 'devices', deviceIds: [dev.deviceId] }));
+    await new Promise((r) => setTimeout(r, 150));
+
+    const framesA = collectFrames(connectorA);
+    const cookie = `ra-device=v1.${Buffer.from(JSON.stringify({ deviceId: dev.deviceId, v: 1 })).toString('base64url')}.x`;
+    const replyPromise = fetch(`http://127.0.0.1:${resolvedPort}/replay-probe`, { headers: { cookie } });
+    replyPromise.catch(() => {});
+    const head = await framesA.waitFor((f) => f.kind === 'http-head' && f.path === '/replay-probe', '合法 owner 应拥有路由');
+    assert.equal(head.deviceId, dev.deviceId);
+
+    connectorA.send(JSON.stringify({ kind: 'http-res-head', deviceId: head.deviceId, streamId: head.streamId, status: 200, headers: { 'content-type': 'text/plain' } }));
+    connectorA.send(JSON.stringify({ kind: 'http-res-body', deviceId: head.deviceId, streamId: head.streamId, chunk: Buffer.from('ok').toString('base64url'), final: true }));
+    await replyPromise;
+  } finally { connectorA?.close(); connectorB?.close(); relay?.kill(); }
+}, { timeout: 20000 });
