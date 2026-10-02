@@ -298,7 +298,7 @@ export class RelayConnector {
         void this.#handlePairBegin(frame);
         return;
       case 'pair-done':
-        this.#handlePairDone(frame);
+        void this.#handlePairDone(frame);
         return;
       case 'auth-begin':
         this.#handleAuthBegin(frame);
@@ -491,9 +491,9 @@ export class RelayConnector {
     }
   }
 
-  #handlePairDone(frame) {
+  async #handlePairDone(frame) {
     try {
-      const result = this.#deps.pairing.complete({ challenge: frame.challenge, sig: frame.sig, ts: frame.ts });
+      const result = await this.#deps.pairing.complete({ challenge: frame.challenge, sig: frame.sig, ts: frame.ts });
       this.send({
         kind: 'pair-result',
         channel: frame.channel,
@@ -571,7 +571,25 @@ export class RelayConnector {
   publishDevices() {
     if (!this.#ws || this.#ws.readyState !== 1) return false;
     try {
-      const deviceIds = (this.#deps.devices?.list?.() ?? []).map((d) => d.deviceId).filter(Boolean);
+      const list = this.#deps.devices?.list?.() ?? [];
+      const deviceIds = list.map((d) => d.deviceId).filter(Boolean);
+      // ★ Pair-Proof 自愈：重连后重放已持久化的配对凭证 —— 中继侧 owners 表
+      //   无论因重启/换机/清盘丢失多少，都能从设备表原件恢复（签名可反复验证）。
+      //   只在协商过 'claim' 的中继上重放；避免旧中继收到未知帧断连。
+      if (this.#claimNegotiated) {
+        for (const d of list) {
+          if (d.claim?.sig && d.deviceId) {
+            this.send({
+              kind: 'device-claim',
+              deviceId: d.claim.deviceId ?? d.deviceId,
+              pubKey: d.claim.pubKey,
+              challenge: d.claim.challenge,
+              sig: d.claim.sig,
+              ts: d.claim.ts
+            });
+          }
+        }
+      }
       return this.send({ kind: 'devices', deviceIds });
     } catch (error) {
       this.#deps.logger?.warn?.(`[kite] publish devices failed: ${error.message}`);

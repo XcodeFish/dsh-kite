@@ -43,7 +43,7 @@ test('配对：完整 happy path（begin → submit → 签名 → complete）',
   const ts = Date.now();
   const msg = Buffer.concat([Buffer.from(challenge), Buffer.from(keys.fingerprint), Buffer.from(String(ts))]);
   const sig = b64e(sign(null, msg, device.privateKey));
-  const done = pairing.complete({ challenge, sig, ts });
+  const done = await pairing.complete({ challenge, sig, ts });
   assert.equal(done.deviceId, deviceId);
   assert.equal(tickets.verify(done.ticket), deviceId, '配对完成即拿到有效票据');
   assert.match(done.setCookie, /^ra-device=v1\./);
@@ -83,8 +83,8 @@ test('配对：错误签名拒绝', async () => {
   const { token } = pairing.begin({});
   const device = deviceKeypair();
   const { challenge } = await pairing.submit({ token, pubKey: device.pubB64 });
-  assert.throws(() => pairing.complete({ challenge, sig: b64e(Buffer.alloc(64)), ts: Date.now() }), PairingError);
-  assert.throws(() => pairing.complete({ challenge: newChallenge(), sig: b64e(Buffer.alloc(64)), ts: Date.now() }), PairingError);
+  await assert.rejects(() => pairing.complete({ challenge, sig: b64e(Buffer.alloc(64)), ts: Date.now() }), PairingError);
+  await assert.rejects(() => pairing.complete({ challenge: newChallenge(), sig: b64e(Buffer.alloc(64)), ts: Date.now() }), PairingError);
 });
 
 test('校验码：6 位数字、确定性与敏感性', () => {

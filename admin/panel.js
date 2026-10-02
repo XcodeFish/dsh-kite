@@ -393,7 +393,7 @@ export function createPairPageHandler(deps) {
       return json(200, { ok: true, challenge, code, deviceId, connectorId: deps.fingerprint });
     }
     if (action === 'complete') {
-      const result = deps.pairing.complete({ challenge: payload.challenge, sig: payload.sig, ts: payload.ts });
+      const result = await deps.pairing.complete({ challenge: payload.challenge, sig: payload.sig, ts: payload.ts });
       // ★ Pair-Proof：result.claim（配对凭证原件）由 handlePairPage 的调用方
       //   （relay-client HTTP 保留路径）读取并转发 device-claim 给中继。
       //   不进 HTTP 响应体 —— 验签材料无需暴露给手机端页面。

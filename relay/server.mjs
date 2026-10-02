@@ -23,8 +23,8 @@
  */
 import http from 'http';
 import https from 'https';
-import { readFileSync } from 'node:fs';
-import { randomUUID } from 'node:crypto';
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { randomUUID, createHash, verify as edVerify, createPublicKey, KeyObject } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import { gzipSync } from 'node:zlib';
 
@@ -42,6 +42,38 @@ const BIN_PAYLOAD_FIELD = {
 };
 class FrameError extends Error {
   constructor(code, message) { super(message); this.code = code; }
+}
+
+// ---- Pair-Proof 设备归属表（2026-10-02 审查定稿）----
+// ★ owners.json 持久化路径：默认 /opt/ra-relay 旁的数据目录不可写（systemd
+//   ProtectSystem=strict + User=ra-relay），因此显式用环境变量 OWNER_STATE_DIR，
+//   install.sh 里 create StateDirectory=ra-relay（即 /var/lib/ra-relay）。
+//   未配置或不可写时降级为「仅内存」（重启后靠连接器重发 claim 恢复 —— 连接器
+//   每次连接都会重放 claim）。
+const OWNERS_FILE = (() => {
+  const dir = process.env.OWNER_STATE_DIR;
+  if (!dir) return null;
+  try { mkdirSync(dir, { recursive: true }); return dir + '/owners.json'; }
+  catch { console.error('[ra-relay] OWNER_STATE_DIR 不可写，owner 表降级为内存模式'); return null;
+  }
+})();
+/** deviceId → { connectorId, sig, ts, challenge, pubKey }：验签通过的归属记录。 */
+const deviceOwners = new Map();
+const CLAIM_PUBKEY_ID_BIND = true; // sha256(pubKey) 必须等于 deviceId（公钥-身份自绑死）
+if (OWNERS_FILE) {
+  try {
+    for (const [k, v] of Object.entries(JSON.parse(readFileSync(OWNERS_FILE, 'utf8')))) deviceOwners.set(k, v);
+    if (deviceOwners.size) console.log(`[ra-relay] 设备归属表恢复：${deviceOwners.size} 条`);
+  } catch { /* 首次启动无文件 —— 正常 */ }
+}
+let ownersFlushTimer = null;
+function persistOwners() {
+  if (!OWNERS_FILE) return;
+  clearTimeout(ownersFlushTimer);
+  ownersFlushTimer = setTimeout(() => {
+    try { writeFileSync(OWNERS_FILE, JSON.stringify(Object.fromEntries(deviceOwners))); }
+    catch (error) { console.error('[ra-relay] owners.json 写入失败:', error.message); }
+  }, 500);
 }
 function isBinEligible(frame, minPayload = 4096) {
   if (!frame || typeof frame !== 'object') return false;
@@ -627,7 +659,9 @@ function onConnector(ws, url) {
   }
   // hello-ack 恒宣告 'bin'（中继单方面支持）。真正启用二进制承载的判据是
   //   binCaps（连接器 hello 宣告过 bin 才登记）—— 双向各自的发送路径独立查表。
-  send(ws, { kind: 'hello-ack', proto: 1, caps: ['http', 'ws', 'pair', 'auth', 'bin'] });
+  //   'claim' 宣告 Pair-Proof 支持：连接器只在 caps 含 'claim' 时才发 device-claim
+  //   （旧中继对未知 kind 会 1002 断连重连 —— 绝不能盲发）。
+  send(ws, { kind: 'hello-ack', proto: 1, caps: ['http', 'ws', 'pair', 'auth', 'bin', 'claim'] });
 
   // ★ maxPayload === MAX_FRAME_BYTES，所以超大帧会在 ws 解析层就被拒并抛 error，
   //   根本走不到下面那句 data.length 检查（那句实际是死代码，保留作二道防线）。
@@ -783,8 +817,56 @@ function relayConnectorFrame(connectorWs, frame) {
     if (stream?.phone) send(stream.phone, frame);
     return;
   }
+  if (kind === 'device-claim') {
+    // ★ Pair-Proof（2026-10-02 审查定稿）：配对凭证验签 —— 归属从「声明」升格为
+    //   「密码学事实」。连接器转发手机在配对时对 (challenge ‖ connectorId ‖ ts)
+    //   的 Ed25519 签名原件；中继用帧内 pubKey 自主验签。
+    //   防伪造: sig 只有持有手机私钥者能产生；pubKey 与 deviceId 自绑死
+    //   （sha256(pubKey) 的 b64url 前 22 字符 == deviceId），拿自己的公钥只能
+    //   认领一个无意义的新 id。防重放漂移: 签名内容绑定 challenge + connectorId，
+    //   同一凭证对「别的连接器」永远验不过。
+    const ownerConnId = connectorIdOf(connectorWs);
+    const claim = frame;
+    // ① 公钥与 deviceId 自绑
+    const derived = createHash('sha256').update(Buffer.from(claim.pubKey, 'base64')).digest();
+    const derivedId = Buffer.from(derived).toString('base64url').slice(0, 22);
+    if (CLAIM_PUBKEY_ID_BIND && derivedId !== claim.deviceId) {
+      recordDrop('claim_id_mismatch', { deviceId: claim.deviceId.slice(0, 12), derived: derivedId.slice(0, 12) });
+      return;
+    }
+    // ② 验签：消息字节串必须与手机端一致（admin/panel.js: ASCII 拼接 challenge+connectorId+ts）
+    //    连接器签名时用的是自己的 fingerprint —— 签名里的 connectorId 与发送者身份绑定
+    const expectedOwner = ownerConnId;
+    if (!expectedOwner) return;
+    const msg = Buffer.concat([
+      Buffer.from(claim.challenge, 'utf8'),
+      Buffer.from(expectedOwner, 'utf8'),
+      Buffer.from(String(claim.ts), 'utf8')
+    ]);
+    let ok = false;
+    try {
+      const pubRaw = Buffer.from(claim.pubKey, 'base64');
+      const jwk = { kty: 'OKP', crv: 'Ed25519', x: Buffer.from(pubRaw).toString('base64url') };
+      ok = edVerify(null, msg, createPublicKey({ key: jwk, format: 'jwk' }), Buffer.from(claim.sig, 'base64url'));
+    } catch { ok = false; }
+    if (!ok) {
+      recordDrop('claim_verify_failed', { deviceId: claim.deviceId.slice(0, 12) });
+      return;
+    }
+    // ③ 验签通过 → 写归属（最后有效 claim 胜：换机重配会产生新 claim 覆盖旧归属）
+    const prev = deviceOwners.get(claim.deviceId);
+    deviceOwners.set(claim.deviceId, { connectorId: expectedOwner, challenge: claim.challenge, sig: claim.sig, ts: claim.ts, pubKey: claim.pubKey });
+    persistOwners();
+    if (prev && prev.connectorId !== expectedOwner) {
+      console.log(`[ra-relay] 设备归属迁移: deviceId=${claim.deviceId.slice(0, 12)} ${prev.connectorId.slice(0, 8)} → ${expectedOwner.slice(0, 8)}（新 claim 覆盖）`);
+    }
+    console.log(`[ra-relay] 设备归属确认: deviceId=${claim.deviceId.slice(0, 12)} → ${expectedOwner.slice(0, 8)}`);
+    return;
+  }
   if (kind === 'devices') {
-    // 连接器上报已配对设备：更新路由表（覆盖式，撤销的设备自然消失）。
+    // 连接器上报已配对设备：更新路由表。
+    // ★ Pair-Proof 语义（2026-10-02 审查后定稿）: 有 claim（owners 表）记录的设备
+    //   只认 owner；无 claim 的设备维持【最后上报者赢】（向后兼容旧连接器）。
     const ids = Array.isArray(frame.deviceIds) ? frame.deviceIds : [];
     const connectorId = connectorIdOf(connectorWs);
     if (connectorId) {
@@ -796,18 +878,24 @@ function relayConnectorFrame(connectorWs, frame) {
           devices.delete(deviceId);
         }
       }
+      let rejected = 0;
       for (const deviceId of ids) {
         if (typeof deviceId !== 'string' || deviceId.length === 0) continue;
+        // ★ 有密码学归属的设备：只认 owner 连接器的上报；他人的上报直接忽略
+        const owner = deviceOwners.get(deviceId);
+        if (owner && owner.connectorId !== connectorId) {
+          rejected++;
+          if (!conflictLogged.has(deviceId + ':' + connectorId)) {
+            console.log(`[ra-relay] 拒绝无凭证的设备路由声明: deviceId=${deviceId.slice(0, 12)} 归属 ${owner.connectorId.slice(0, 8)}，来源 ${connectorId.slice(0, 8)}`);
+            conflictLogged.add(deviceId + ':' + connectorId);
+          }
+          continue;
+        }
         const existing = devices.get(deviceId);
         if (existing) {
-          // ★ 同一 deviceId 出现在两个连接器的上报里 = 配置错误（两套数据目录/两台
-          //   机器共用 token）。中继无法验证谁是真身（token 相同），这里保持
-          //   【最后上报者赢】并打冲突日志（真机事故 2026-10-02：曾尝试「后到者
-          //   拒绝」的所有权保护，结果 phantom 先上报时把正当连接器永久锁在外面，
-          //   比摇摆更糟 —— 已回滚）。真正的解是消灭多余连接器：同一 token 只该
-          //   有一台机器跑连接器；手机侧 4503 的验票失败会自然兜底，不泄露。
+          // 无 claim 的设备维持【最后上报者赢】+ 冲突日志可观测
           if (existing.connectorId !== connectorId && !conflictLogged.has(deviceId + ':' + connectorId)) {
-            console.log(`[ra-relay] 设备路由冲突：deviceId=${deviceId.slice(0, 12)} 由 ${existing.connectorId.slice(0, 8)} 改归 ${connectorId.slice(0, 8)}（多个连接器上报同一设备 —— 检查是否有别的机器在跑本插件）`);
+            console.log(`[ra-relay] 设备路由冲突（无 claim）: deviceId=${deviceId.slice(0, 12)} 由 ${existing.connectorId.slice(0, 8)} 改归 ${connectorId.slice(0, 8)}`);
             conflictLogged.add(deviceId + ':' + connectorId);
           }
           existing.connectorId = connectorId;
@@ -815,7 +903,7 @@ function relayConnectorFrame(connectorWs, frame) {
           devices.set(deviceId, { connectorId, phones: new Set() });
         }
       }
-      console.log(`[ra-relay] 设备路由表更新：connector=${connectorId.slice(0, 8)} devices=${ids.length}`);
+      console.log(`[ra-relay] 设备路由表更新：connector=${connectorId.slice(0, 8)} devices=${ids.length}${rejected ? `（拒绝他人 owned ${rejected} 条）` : ''}`);
     }
     return;
   }
@@ -827,6 +915,9 @@ function relayConnectorFrame(connectorWs, frame) {
       }
       devices.delete(frame.deviceId);
     }
+    // ★ Pair-Proof：kick 同时清除归属（撤销 = owner 事实消除；重配对产生新 claim）。
+    deviceOwners.delete(frame.deviceId);
+    persistOwners();
     return;
   }
   if (kind === 'hello') {

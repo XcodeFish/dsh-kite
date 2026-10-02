@@ -105,7 +105,7 @@ export function createPairingService({ keys, tickets, devices, ttlMs, logger, au
      * 会话按 challenge 定位（thin client 帧流与 PWA 页共用）。
      * 返回 {ok:true, deviceId, ticket, code, setCookie} 或抛 PairingError。
      */
-    complete({ challenge, sig, ts }) {
+    async complete({ challenge, sig, ts }) {
       sweep();
       const session = [...pending.values()].find((entry) => entry.deviceId && entry.challenge === challenge);
       if (!session) {
@@ -125,12 +125,15 @@ export function createPairingService({ keys, tickets, devices, ttlMs, logger, au
       //   配对那一刻「该设备属于本连接器」的密码学事实。连接器应把它转交中继
       //   （device-claim 帧），中继验签后持久化归属（Pair-Proof，2026-10-02）。
       //   challenge 原样带上（b64url 字符串），中继无需解析即可复验绑定关系。
+      //   同时落到设备条目（devices.json）—— 连接器重连/中继重启后可重放恢复归属。
+      const claim = { deviceId: session.deviceId, pubKey: device.pubKey, sig, ts, challenge };
+      await devices.attachClaim(session.deviceId, claim);
       return {
         deviceId: session.deviceId,
         ticket,
         code: session.code,
         setCookie: deviceCookie('ra-device', ticket, 12 * 3600, secureCookies),
-        claim: { deviceId: session.deviceId, pubKey: device.pubKey, sig, ts, challenge }
+        claim
       };
     },
 

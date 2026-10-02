@@ -87,11 +87,24 @@ export class DeviceStore {
       kind: kind || prev?.kind || 'pwa',
       pairedAt: prev?.pairedAt ?? now,
       lastActiveAt: prev?.lastActiveAt ?? now,
-      revoked: false
+      revoked: false,
+      // ★ Pair-Proof：配对凭证原件（手机私钥签名）在此持久化。签名可反复验证，
+      //   连接器重连/中继重启后重放 claim 即可恢复归属绑定 —— 自愈闭环的最后
+      //   一块：owners 表在任何一侧丢失都能从设备表原件恢复。
+      claim: prev?.claim ?? null
     };
     this.#devices.set(deviceId, entry);
     await this.#persist();
     return { ...entry, created: !prev };
+  }
+
+  /** Pair-Proof：配对完成后把凭证原件落到设备条目（随 devices.json 持久化）。 */
+  async attachClaim(deviceId, claim) {
+    const entry = this.#devices.get(deviceId);
+    if (!entry) return false;
+    entry.claim = claim;
+    await this.#persist();
+    return true;
   }
 
   /** 撤销：位置删除（下一次握手即失败；在线连接由调用方 kick）。 */
