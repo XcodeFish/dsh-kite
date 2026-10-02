@@ -327,6 +327,16 @@ export class RelayConnector {
           || stream.path === '/kite/welcome' || stream.path.startsWith('/kite/welcome?')) {
         const res = await this.#deps.handlePairPage?.({ method: stream.method, path: stream.path, headers: stream.headers, body });
         if (res) {
+          // ★ 配对成功立即上报设备表。真机事故 2026-10-02：这段补丁原先只加在
+          //   `#handlePairDone`（**信令通道** `pair-done` 帧），但配对页走的是
+          //   **HTTP 保留路径**（panel.js 里 `POST /kite/pair/complete`），两者是
+          //   完全独立的入口 —— 结果补丁形同虚设：新配对设备的 deviceId 不在中继
+          //   路由表里，而浏览器加载 assets 是**不带 c**的（相对路径 ./assets/…），
+          //   只能靠 cookie 路由 → 全部 401 → 应用起不来 → 白屏 /「Failed to load
+          //   plugins / HTML did not preload」。等连接器下次重连才自愈。
+          //   这里按路径判定「本次是否完成了配对」，完成则立刻上报。
+          const isPairComplete = stream.path.startsWith('/kite/pair/complete') && res.status === 200;
+          if (isPairComplete) this.publishDevices();
           this.#sendHttpResponse(stream.deviceId, streamId, res, stream);
           return;
         }

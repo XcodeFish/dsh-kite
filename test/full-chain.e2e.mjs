@@ -111,6 +111,12 @@ await new Promise((res, rej) => {
             void fakeRes;
           });
         }
+        // ★ 这行是**测试替身**，不是生产代码 —— 它掩盖过一个真实缺陷（2026-10-02）：
+        //   生产代码 `#handleHttp` 的配对保留路径里并没有 publishDevices，这里手工
+        //   补上了，于是本 e2e 一直绿，而真机上「新配对设备的 assets 全 401 → 白屏 /
+        //   Failed to load plugins」。生产侧已修（relay-client.js 的 #handleHttp 配对
+        //   分支）。保留此替身是为了让本 e2e 专注测中继桥接；生产行为的回归改由
+        //   relay.integration.test.mjs 的「配对完成后连接器应上报设备表」覆盖。
         if (s.path.includes('/pair/complete') && r.status === 200) setTimeout(publishDevices, 50);
         connector.send(encodeFrame({ kind: 'http-res-head', deviceId: s.deviceId, streamId: f.streamId, status: r.status, headers: r.headers ?? {} }));
         connector.send(encodeFrame({ kind: 'http-res-body', deviceId: s.deviceId, streamId: f.streamId, chunk: (r.body ?? Buffer.alloc(0)).toString('base64url'), final: true }));
