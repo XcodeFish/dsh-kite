@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>DSH 移动端自适应原型 v2 · 零新增控件</title>
+<title>DSH 移动端自适应原型 v3 · 交互零变更</title>
 <style>
 :root{
   --bg:#09090b; --panel:#0e1116; --card:#151a21; --line:#232b36; --line2:#1d242e;
-  --fg:#e6e8eb; --dim:#9aa4b2; --faint:#6b7684; --acc:#2f81f7; --ok:#7ee2b8; --warn:#e3b341; --bad:#f85149;
+  --fg:#e6e8eb; --dim:#9aa4b2; --faint:#6b7684; --acc:#2f81f7; --warn:#e3b341; --bad:#f85149;
   --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
 }
 *{box-sizing:border-box}
@@ -31,7 +31,7 @@ h1{font-size:15px;margin:0}
 .stage{display:flex;gap:18px;align-items:flex-start}
 .device-wrap{flex:0 0 auto;transition:width .18s ease;max-width:100%}
 .device{width:100%;height:640px;background:var(--panel);border:1px solid var(--line);border-radius:14px;overflow:hidden;position:relative;container-type:inline-size;container-name:app}
-.stage-side{flex:1;min-width:280px;max-width:380px}
+.stage-side{flex:1;min-width:280px;max-width:360px}
 .note-card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
 .note-card h3{margin:0 0 6px;font-size:12px;color:#9ec3ff}
 .note-card p,.note-card li{font-size:12px;color:var(--dim);margin:4px 0;line-height:1.7}
@@ -39,7 +39,7 @@ h1{font-size:15px;margin:0}
 .note-card b{color:var(--fg)}
 .mono{font-family:var(--mono);font-size:11px}
 
-/* ============ 应用骨架：与 DSH GUI 同构（侧栏 / 主区 / 右栏） ============ */
+/* ============ 应用骨架：与 DSH GUI 同构，交互与桌面完全一致 ============ */
 .app{position:absolute;inset:0;display:flex;flex-direction:column;font-size:13px}
 .topbar{flex:0 0 auto;height:46px;display:flex;align-items:center;gap:8px;padding:0 10px;border-bottom:1px solid var(--line2)}
 .icon-btn{width:34px;height:34px;flex:0 0 auto;display:grid;place-items:center;border:0;background:transparent;color:var(--dim);border-radius:8px;font-size:15px;cursor:pointer}
@@ -47,15 +47,17 @@ h1{font-size:15px;margin:0}
 .topbar .title{font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .topbar .spacer{flex:1}
 .avatar{width:26px;height:26px;border-radius:50%;background:linear-gradient(135deg,#2f81f7,#7c5cff);flex:0 0 auto}
-.app-body{flex:1;display:flex;min-height:0;position:relative}
+.app-body{flex:1;display:flex;min-height:0}
 
-/* 左侧栏：会话列表（宿主已有折叠按钮，这里 ☰ 即代表它） */
-.left{flex:0 0 230px;border-right:1px solid var(--line2);display:flex;flex-direction:column;background:#0c1015;min-height:0}
-.new-btn{margin:10px;padding:8px;border:1px solid var(--acc);border-radius:8px;background:rgba(47,129,247,.12);color:#9ec3ff;font-size:12px;cursor:pointer}
-.sess-list{overflow:auto;padding:0 8px 10px;flex:1}
+/* 左侧栏：折叠/展开 = 宿主已有功能（☰ 同一个按钮），展开为挤占式，与桌面一致 */
+.left{flex:0 0 230px;border-right:1px solid var(--line2);display:flex;flex-direction:column;background:#0c1015;min-height:0;transition:flex-basis .18s ease;overflow:hidden}
+.new-btn{margin:10px;padding:8px;border:1px solid var(--acc);border-radius:8px;background:rgba(47,129,247,.12);color:#9ec3ff;font-size:12px;cursor:pointer;white-space:nowrap}
+.sess-list{overflow:hidden;padding:0 8px 10px;flex:1}
 .sess{padding:8px 10px;border-radius:8px;color:var(--dim);font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .sess.on{background:#1a2028;color:var(--fg)}
 .sess small{display:block;color:var(--faint);font-size:10px}
+/* 折叠态：只显示首字符圆点（宿主折叠态同类形态） */
+.dot{display:none;width:28px;height:28px;margin:4px auto;border-radius:50%;background:#1a2028;color:var(--dim);font-size:11px;text-align:center;line-height:28px}
 
 /* 主区 */
 .main{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0}
@@ -66,7 +68,6 @@ h1{font-size:15px;margin:0}
 .msg .meta{font-size:10px;color:var(--faint);margin-bottom:4px;display:flex;gap:8px;flex-wrap:wrap}
 .toolchip{display:inline-flex;gap:6px;border:1px solid var(--line);border-radius:6px;padding:2px 8px;font-size:11px;color:var(--dim);font-family:var(--mono)}
 .codeblk{background:#0b0e12;border:1px solid var(--line2);border-radius:8px;padding:8px 10px;font-family:var(--mono);font-size:11px;overflow:auto;white-space:pre;color:#c9d1d9;margin:6px 0 0}
-/* 审批卡（in-stream，与宿主一致） */
 .approval{align-self:stretch;border:1px solid rgba(227,179,65,.4);background:#1c1608;border-radius:12px;padding:12px 14px}
 .approval .a-head{font-size:12px;color:var(--warn);font-weight:600}
 .approval .a-body{font-size:12px;color:var(--dim);margin:8px 0;font-family:var(--mono);background:#120e04;border-radius:8px;padding:8px 10px;overflow:auto;max-height:110px;white-space:pre}
@@ -74,7 +75,6 @@ h1{font-size:15px;margin:0}
 .abtn{flex:1;padding:9px 0;border-radius:8px;font-size:13px;border:1px solid var(--line);cursor:pointer}
 .abtn.allow{background:var(--acc);border-color:var(--acc);color:#fff}
 .abtn.deny{background:transparent;color:var(--bad);border-color:rgba(248,81,73,.5)}
-/* 输入区 */
 .composer{flex:0 0 auto;border-top:1px solid var(--line2);padding:10px 14px 12px;display:flex;flex-direction:column;gap:8px}
 .c-row1{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .chip{border:1px solid var(--line);border-radius:999px;padding:3px 10px;font-size:11px;color:var(--dim)}
@@ -83,15 +83,15 @@ h1{font-size:15px;margin:0}
 .c-input:focus{outline:1px solid var(--acc)}
 .send{flex:0 0 auto;width:38px;height:38px;border-radius:10px;border:0;background:#29313c;color:#6b7684;font-size:15px;display:grid;place-items:center;cursor:pointer}
 .send.on{background:var(--acc);color:#fff}
-/* 右栏：文件 / 终端（宿主已有折叠按钮，▭ 即代表它） */
-.right{flex:0 0 260px;border-left:1px solid var(--line2);display:flex;flex-direction:column;background:#0c1015;min-height:0}
+/* 右栏：开/关 = 宿主已有功能（▭ 同一个按钮），行为与桌面一致 */
+.right{flex:0 0 240px;border-left:1px solid var(--line2);display:flex;flex-direction:column;background:#0c1015;min-height:0;overflow:hidden}
 .rtabs{display:flex;border-bottom:1px solid var(--line2);flex:0 0 auto}
-.rtabs button{flex:1;padding:9px 0;background:transparent;border:0;color:var(--faint);font-size:11px;border-bottom:2px solid transparent;cursor:pointer}
+.rtabs button{flex:1;padding:9px 0;background:transparent;border:0;color:var(--faint);font-size:11px;border-bottom:2px solid transparent;cursor:pointer;white-space:nowrap}
 .rtabs button.on{color:var(--fg);border-bottom-color:var(--acc)}
 .rpane{flex:1;overflow:auto;padding:10px;font-size:12px;color:var(--dim)}
 .file-row{display:flex;gap:8px;align-items:center;padding:6px;border-radius:6px}
+.file-row .fname{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .term{font-family:var(--mono);font-size:11px;color:#9ec3ff;white-space:pre;background:#07090c;border-radius:8px;padding:10px;height:100%;overflow:auto}
-/* 页面视图（设置/市场 = 宿主路由页） */
 .page{flex:1;overflow:auto;padding:14px 16px}
 .page h4{margin:2px 0 10px;font-size:14px}
 .set-list{border:1px solid var(--line2);border-radius:10px;overflow:hidden}
@@ -104,24 +104,22 @@ h1{font-size:15px;margin:0}
 .mk-card{border:1px solid var(--line2);border-radius:10px;padding:10px;background:#10151c}
 .mk-card .nm{font-size:12px;margin:0 0 2px}
 .mk-card .ds{font-size:10.5px;color:var(--faint);line-height:1.5}
-/* 遮罩 */
-.scrim{position:absolute;inset:0;z-index:25;background:rgba(4,6,10,.5);opacity:0;pointer-events:none;transition:opacity .2s}
 
-/* ============ 唯一的窄屏规则：侧栏「推开」变「覆盖」，其余不动 ============ */
+/* ============ 自适应规则：只收宽度，不改结构、不加控件、不换模式 ============ */
+/* ≤899：左栏默认进入折叠形态（52px 图标列，宿主折叠按钮一键展开回桌面形态） */
 @container app (max-width: 899.9px){
-  .left,.right{
-    position:absolute;z-index:30;top:0;bottom:0;width:min(320px,86%);
-    box-shadow:0 0 40px rgba(0,0,0,.5);
-    transition:transform .22s ease;
-  }
-  .left{left:0;transform:translateX(-105%)}
-  .right{right:0;transform:translateX(105%)}
-  .app.left-open .left{transform:none}
-  .app.right-open .right{transform:none}
-  .app.left-open .scrim,.app.right-open .scrim{opacity:1;pointer-events:auto}
+  .app:not(.left-expanded) .left{flex-basis:52px}
+  .app:not(.left-expanded) .new-btn{margin:10px auto;padding:0;width:32px;height:32px;font-size:15px}
+  .app:not(.left-expanded) .sess{padding:2px 0}
+  .app:not(.left-expanded) .sess .txt{display:none}
+  .app:not(.left-expanded) .sess .dot{display:block}
+  .right{flex-basis:200px}
   .msg{max-width:92%}
 }
+/* ≤639：右栏收窄、tab 字号微调；消息满宽；触控/字号微调 */
 @container app (max-width: 639.9px){
+  .right{flex-basis:150px}
+  .rtabs button{padding:12px 0;font-size:10px}
   .msg{max-width:100%}
   .codeblk{max-height:180px}
   .c-input{font-size:16px;min-height:44px}   /* ≥16px 防 iOS 聚焦放大 */
@@ -131,16 +129,13 @@ h1{font-size:15px;margin:0}
   .set-item{padding:13px 12px}
   .approval .a-body{max-height:90px}
 }
-@container app (min-width: 900px){
-  .scrim{display:none}                        /* 桌面侧栏始终可见，无需遮罩 */
-}
 </style>
 </head>
 <body>
 <div class="console">
   <div class="console-head">
-    <h1>DSH 移动端自适应原型 v2</h1>
-    <span class="tag">零新增控件 · 侧栏推开→覆盖 · 聊天常驻主屏</span>
+    <h1>DSH 移动端自适应原型 v3</h1>
+    <span class="tag">交互零变更 · 只收宽度 · 折叠态用宿主已有形态</span>
   </div>
 
   <div class="ctrls">
@@ -163,65 +158,60 @@ h1{font-size:15px;margin:0}
       <div class="device" id="dev">
         <div class="app" id="app">
           <div class="topbar">
-            <button class="icon-btn" id="btn-menu" title="会话列表（宿主已有按钮）">☰</button>
+            <button class="icon-btn" id="btn-menu" title="折叠/展开会话列表（宿主已有按钮）">☰</button>
             <div class="title">MoonStarsLab — 会话</div>
             <div class="spacer"></div>
-            <button class="icon-btn" id="btn-panel" title="文件 / 终端（宿主已有按钮）">▭</button>
+            <button class="icon-btn" id="btn-panel" title="折叠/展开文件终端栏（宿主已有按钮）">▭</button>
             <div class="avatar"></div>
           </div>
 
           <div class="app-body">
             <aside class="left" id="left">
-              <button class="new-btn">＋ 新会话</button>
+              <button class="new-btn" id="newbtn"><span class="txt">＋ 新会话</span></button>
               <div class="sess-list">
-                <div class="sess on">MoonStarsLab 主线<small>4 分钟前 · 199 步</small></div>
-                <div class="sess">kite 中继排障<small>1 小时前</small></div>
-                <div class="sess">Jet-Hub 0.4.1 补丁<small>昨天</small></div>
-                <div class="sess">magpie 405 分析<small>昨天</small></div>
-                <div class="sess">工作区重构<small>10-01</small></div>
+                <div class="sess on"><span class="dot">M</span><span class="txt">MoonStarsLab 主线<small>4 分钟前 · 199 步</small></span></div>
+                <div class="sess"><span class="dot">k</span><span class="txt">kite 中继排障<small>1 小时前</small></span></div>
+                <div class="sess"><span class="dot">J</span><span class="txt">Jet-Hub 0.4.1 补丁<small>昨天</small></span></div>
+                <div class="sess"><span class="dot">m</span><span class="txt">magpie 405 分析<small>昨天</small></span></div>
+                <div class="sess"><span class="dot">工</span><span class="txt">工作区重构<small>10-01</small></span></div>
               </div>
             </aside>
 
             <section class="main" id="main">
-              <!-- 会话视图 -->
               <div class="stream" id="v-chat">
-                <div class="msg user">上一版交互太复杂了，简化。</div>
-                <div class="msg ai"><div class="meta">M3.1-Flash-Preview</div>对。这版删掉了底部 Tab、抽屉把手和「更多」枢纽——导航全部复用宿主已有按钮，CSS 只把侧栏从「推开内容」改成「覆盖内容」。<div class="toolchip">⚙ 无新增控件</div><div class="toolchip">⚙ 零 JS 导航</div></div>
+                <div class="msg user">不改变交互，只是自适应。</div>
+                <div class="msg ai"><div class="meta">M3.1-Flash-Preview</div>明白。这版没有任何模式切换：还是三栏、还是同一批按钮，窄屏只是把侧栏收窄——收窄后的形态就是宿主自带的折叠态。<div class="toolchip">⚙ 布局不变</div><div class="toolchip">⚙ 无新增控件</div><div class="toolchip">⚙ 无 JS 行为</div></div>
                 <div class="approval">
                   <div class="a-head">⚠ 权限请求 · write</div>
-                  <div class="a-body">edit  admin/panel-client.js
-  +0  -2  移除手机端死按钮（/kite 设备侧 404）</div>
+                  <div class="a-body">edit  admin/mobile-skin.js
+  +42  -0  纯收缩规则（无遮罩/无覆盖/无模式）</div>
                   <div class="a-actions">
                     <button class="abtn allow">允许</button>
                     <button class="abtn deny">拒绝</button>
                   </div>
                 </div>
-                <div class="msg ai"><div class="meta"><span class="toolchip">⚙ edit mobile-skin.js</span></div>审批卡出现在消息流里（和桌面一致），全宽 + 大按钮，看完点掉即走。</div>
-                <div class="msg user">在手机上点 ☰ 看会话列表，点 ▭ 看文件。</div>
+                <div class="msg user">手机上就是同一个界面，挤一挤。</div>
               </div>
 
-              <!-- 设置页（宿主路由，原型外部按钮切换） -->
               <div class="page" id="v-settings" hidden>
                 <h4>设置</h4>
                 <div class="set-list">
-                  <div class="set-item"><div class="nm">账号与订阅<small>DeepSeek 登录 · GLM Coding Plan</small></div><span class="arrow">›</span></div>
+                  <div class="set-item"><div class="nm">账号与订阅<small>DeepSeek 登录</small></div><span class="arrow">›</span></div>
                   <div class="set-item"><div class="nm">模型<small>默认渠道</small></div><span class="arrow">›</span></div>
                   <div class="set-item"><div class="nm">插件<small>18 已启用</small></div><span class="arrow">›</span></div>
                   <div class="set-item"><div class="nm">浏览器访问<small>Browser Access</small></div><span class="arrow">›</span></div>
-                  <div class="set-item"><div class="nm">权限预设<small>远程锁定 default</small></div><span class="arrow">›</span></div>
                 </div>
               </div>
 
-              <!-- 市场页 -->
               <div class="page" id="v-market" hidden>
                 <h4>插件市场</h4>
                 <div class="mk-grid">
-                  <div class="mk-card"><div class="nm">🪁 dsh-kite</div><div class="ds">手机远程访问 · 纯出站</div></div>
+                  <div class="mk-card"><div class="nm">🪁 dsh-kite</div><div class="ds">手机远程访问</div></div>
                   <div class="mk-card"><div class="nm">🧠 dsh-mnemon</div><div class="ds">记忆控制平面</div></div>
                   <div class="mk-card"><div class="nm">📏 billion-context</div><div class="ds">上下文压缩</div></div>
                   <div class="mk-card"><div class="nm">✈️ dsh-pilot</div><div class="ds">编码驾驶舱</div></div>
                   <div class="mk-card"><div class="nm">💬 im-connect</div><div class="ds">微信接入</div></div>
-                  <div class="mk-card"><div class="nm">🎨 ultra-skin</div><div class="ds">推理档位皮肤</div></div>
+                  <div class="mk-card"><div class="nm">🎨 ultra-skin</div><div class="ds">档位皮肤</div></div>
                 </div>
               </div>
 
@@ -240,37 +230,34 @@ h1{font-size:15px;margin:0}
 
             <aside class="right" id="right">
               <div class="rtabs">
-                <button class="on" data-t="files">文件</button>
-                <button data-t="term">终端</button>
+                <button class="on" data-t="files"><span class="tl">文件</span></button>
+                <button data-t="term"><span class="tl">终端</span></button>
               </div>
               <div class="rpane" data-t="files">
-                <div class="file-row">📄 <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">mobile-skin.js</span></div>
-                <div class="file-row">📄 <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">reverse-proxy.js</span></div>
-                <div class="file-row">📦 <span style="flex:1;color:#9ec3ff">mobile-adaptive-prototype.html</span></div>
+                <div class="file-row">📄 <span class="fname">mobile-skin.js</span></div>
+                <div class="file-row">📄 <span class="fname">reverse-proxy.js</span></div>
+                <div class="file-row">📦 <span class="fname" style="color:#9ec3ff">prototype.html</span></div>
               </div>
               <div class="rpane" data-t="term" hidden>
                 <div class="term">$ tail -f harness.log
 [kite] relay open
-[kite] devices=1
 $ █</div>
               </div>
             </aside>
           </div>
-
-          <div class="scrim" id="scrim"></div>
         </div>
       </div>
     </div>
 
     <div class="stage-side">
       <div class="note-card">
-        <h3>v2 交互模型（一句话）</h3>
-        <p><b>聊天常驻主屏；其余一切都是打开→关闭的覆盖层。</b>会话列表、文件/终端、设置/市场，全部复用宿主已有按钮与路由，适配层没有发明任何新控件。</p>
+        <h3>v3 自适应规则（全部规则一目了然）</h3>
         <ul>
-          <li><b>≤899px 唯一变化</b>：侧栏从「挤占内容」变「滑入覆盖 + 遮罩」，关掉即回主屏。</li>
-          <li><b>≤639px 元素级</b>：消息满宽、输入 16px 防缩放、按钮 44px、审批大按钮——纯 CSS。</li>
-          <li><b>零 JS 导航</b>：上一版的底栏/抽屉/更多枢纽已删除——那需要注入 JS 造控件，脆且要重新学习。</li>
-          <li><b>设置/市场</b>：宿主本来就整页路由，窄屏只是列表/网格自然变窄，无需专门交互。</li>
+          <li><b>结构不动</b>：三栏还是三栏、按钮还是那批按钮，没有遮罩/覆盖/底部导航/模式切换。</li>
+          <li><b>≤899</b>：左栏收成 <span class="mono">52px</span> 图标列（= 宿主自带折叠形态）；右栏 240→200px；消息放宽到 92%。</li>
+          <li><b>≤639</b>：右栏收窄、tab 字号微调；消息满宽；输入 <span class="mono">16px</span> 防 iOS 缩放；按钮 <span class="mono">44px</span> 触控；市场两列。</li>
+          <li><b>展开 = 桌面同款</b>：点 ☰ / ▭ 挤占式展开、再点收回——与桌面折叠按钮行为一致，原型里可直接试。</li>
+          <li><b>零 JS 行为</b>：适配层纯 CSS；点按、路由、面板开合全部走宿主原有逻辑。</li>
         </ul>
       </div>
     </div>
@@ -280,7 +267,7 @@ $ █</div>
 <script>
 (function () {
   var $ = function (id) { return document.getElementById(id); };
-  var app = $('app'), dev = $('dev'), wrap = $('devwrap');
+  var app = $('app'), wrap = $('devwrap');
   var slider = $('w'), wr = $('wr');
 
   function setWidth(w) {
@@ -298,19 +285,9 @@ $ █</div>
   });
   setWidth(1180);
 
-  // 侧栏开关 = 宿主已有按钮，行为就一个：开/关覆盖层
-  $('btn-menu').addEventListener('click', function () {
-    app.classList.toggle('left-open');
-    app.classList.remove('right-open');
-  });
-  $('btn-panel').addEventListener('click', function () {
-    app.classList.toggle('right-open');
-    app.classList.remove('left-open');
-  });
-  $('scrim').addEventListener('click', function () {
-    app.classList.remove('left-open');
-    app.classList.remove('right-open');
-  });
+  // ☰ / ▭ = 宿主已有折叠按钮：挤占式展开/收回，与桌面行为一致（原型模拟）
+  $('btn-menu').addEventListener('click', function () { app.classList.toggle('left-expanded'); });
+  $('btn-panel').addEventListener('click', function () { app.classList.toggle('right-expanded'); });
 
   // 右栏内 tabs（宿主已有）
   var rtabs = document.querySelectorAll('.rtabs button');
@@ -323,7 +300,7 @@ $ █</div>
     });
   });
 
-  // 原型视角切换（模拟宿主路由，非适配层新增）
+  // 原型视角切换（模拟宿主整页路由）
   document.querySelectorAll('.vbtn').forEach(function (b) {
     b.addEventListener('click', function () {
       document.querySelectorAll('.vbtn').forEach(function (x) { x.classList.toggle('on', x === b); });

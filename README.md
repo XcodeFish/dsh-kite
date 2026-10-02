@@ -105,7 +105,7 @@ curl -s http://127.0.0.1:8787/healthz              # 服务器本机回环
 | `WSS /device` / 其它任意路径 | 手机：HTTP/WS 全桥接到 Connector；手机侧 WS 已协商 **permessage-deflate**（实时流线上字节省 ~81%） |
 | `GET /healthz` `/metrics` | 健康检查 / Prometheus 指标 |
 
-中继职责边界（严格）：只配对转发 + 限流（单 IP 60/min、设备连接上限、1 MiB 帧上限、8 MiB 请求体上限、30s 响应看门狗）+ 连接器 keepalive（30s 无 pong 即剔除僵尸连接）。不持有设备公钥、不解密、不持久化、不做信任判断 —— **中继是可用性组件，不是安全组件**。
+中继职责边界：配对转发 + 限流（单 IP 60/min、设备连接上限、1 MiB 帧上限、8 MiB 请求体上限、30s 响应看门狗）+ 连接器 keepalive（30s 无 pong 剔除）+ 手机 socket 保活（60s）。中继唯一持久化与信任判断是 **Pair-Proof 归属验签**（`owners.json`，见 §7）；不解密业务流量、不读用户数据。
 
 ## 5. 使用流程
 
@@ -146,6 +146,7 @@ curl -s http://127.0.0.1:8787/healthz              # 服务器本机回环
 - **PWA 模式的 TLS 终结点在中继**（E2E 不适用于未改造的 PWA）。thin-client sealed 模式（X25519+HKDF+AEAD，中继只见密文）的加密原语与帧已就绪（`transport/e2e.js`）。
 - 配对链接泄露窗口 = 120s 且单次有效；**真正的长期凭据是设备私钥**（在手机里），不是 URL。
 - 残余风险：Connector 持全权 loopback cookie（单一信任点，靠小代码量 + 审计 + host-adapter 收口）；中继域名被劫持时 PWA 模式退化为「对中继的 TLS 信任」；手机丢失 → 面板一键撤销。
+- **Pair-Proof（设备归属密码学绑定）**：配对完成时手机私钥签名 `(challenge ‖ connectorId ‖ ts)`，连接器经 `device-claim` 帧交中继自主验签，归属持久化到中继 `/var/lib/ra-relay/owners.json` —— 同 token 下任何其它机器（克隆/备份扩散的连接器）都无法声明这些设备的路由。换机 = 面板撤销 + 重扫（新密钥 → 新 claim 覆盖）。
 - P0：kill switch（面板/`killswitch.json`）→ 撤销全部设备 → 关中继。
 
 ## 8. 性能（公网隧道实测，2026-10-02）
@@ -159,13 +160,14 @@ curl -s http://127.0.0.1:8787/healthz              # 服务器本机回环
 | 带指纹资源 `immutable` 强缓存 | 中继 | 二次打开省 92% 流量 |
 | 响应 gzip（level 6） | 连接器 | JSON/JS 响应省 75–85% |
 | **permessage-deflate** | 中继↔手机 WS | 实时流省 **81%**（真实载荷基准） |
+| **二进制承载帧** | 连接器↔中继 WS | 大载荷免 b64+JSON 膨胀，省 25% + 解码 CPU ~5x |
 
-规划中：二进制帧协议（替换 base64+JSON，省 33% 体积 + 降 CPU）、局域网直连模式（同网段手机直连 Mac，消除 2×VPS RTT）。
+规划中：局域网直连模式（同网段手机直连 Mac，消除 2×VPS RTT）。
 
 ## 9. 测试与探针
 
 ```bash
-npm test          # 140 项测试（帧/E2E/票据/设备存储/配对/策略/凭据/重建/审计/中继集成/真机回归）
+npm test          # 151 项测试（帧/E2E/票据/设备存储/配对/策略/凭据/重建/审计/中继集成/真机回归）
 npm run probe     # 离线宿主契约断言（DSH 升级后先跑这个）
 npm run verify    # 全链路：单测 + 面板 e2e + 配对流 + 全链 e2e + 浏览器模拟 + WS 复验
 node test/live-public-pair.verify.mjs   # 线上验收：真实走一遍公网配对 + 资源路由检查
@@ -177,7 +179,10 @@ node test/live-public-pair.verify.mjs   # 线上验收：真实走一遍公网�
 - 不回 pong 的僵尸连接器被 keepalive 剔除；
 - 无法路由的 ra-device 必须立刻应答，不得静默吞掉请求（挂死事故）；
 - 手机建 WS（URL 不带 c）不得把设备挤出路由表（实时同步丢失事故）；
-- 配对完成后连接器必须自发上报设备表（白屏 / Failed to load plugins 事故）。
+- 配对完成后连接器必须自发上报设备表（白屏 / Failed to load plugins 事故）；
+- 路由条目不随手机 socket 断开消失（连接不稳定事故）；
+- 未认证 `?d=` 不得改写已发布设备的路由（路由劫持，探针 `route-hijack.probe.mjs` 复现 → 加固后未复现）；
+- Pair-Proof：合法 claim 绑定归属 / 伪造 claim 拒绝 / claim 绑定 connectorId 防重放换主。
 
 在宿主内的三假设探针：管理面板 → 「运行探针」，期望 `overall:"ok"`。任何 failed → 先查「浏览器访问」是否开启（最常见的 403 来源）。
 
@@ -192,6 +197,7 @@ node test/live-public-pair.verify.mjs   # 线上验收：真实走一遍公网�
 | 实时数据不更新、越用越卡 | 老版本中继的 WS 路由 bug（c38cf6e 前）。升级中继 |
 | 改了代码没生效 | 重启 DSH（宿主只在启动时加载插件模块） |
 | 部署后行为像旧版 | 先核 `md5sum /opt/ra-relay/server.mjs`（§4）—— 多半是包没更新或服务没真正 restart（uptime 会说实话） |
+| 疑似设备路由被其它连接器污染 | 中继日志 `journalctl -u ra-relay \| grep -E '设备路由冲突\|拒绝无凭证\|设备归属'`——Pair-Proof 后有归属的设备不可能被抢注 |
 
 ## 11. 目录
 
@@ -205,7 +211,7 @@ proxy/                loopback 凭据 / 反向代理 / WS 桥（RFC6455 最小�
 approvals/            审批旁听审计
 admin/                管理面板 + 手机配对页 + kill switch
 relay/                独立中继（唯一允许依赖 ws：server.mjs + deploy/ 一键部署包）
-test/                 140 项测试 + 离线宿主探针 + 线上验收脚本
+test/                 151 项测试 + 离线宿主探针 + 线上验收脚本
 ```
 
 ## 12. 与设计方案的有意偏差（ADR 补记）
