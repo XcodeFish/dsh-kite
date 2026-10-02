@@ -9,17 +9,35 @@
  *
  * Kill switch：持久化 killswitch.json；enabled=true 时 connector 不再重连（P0 手段）。
  */
-import { timingSafeEqual } from 'node:crypto';
+import { randomBytes } from 'node:crypto';
 import { qrMatrix } from './qr.js';
 import { promises as fsp } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { VIA_HEADER } from '../proxy/reverse-proxy.js';
 
 const KILL_FILE = 'killswitch.json';
 const OVERRIDE_FILE = 'relay-override.json';
 const ADMIN_BODY_LIMIT = 64 * 1024;
 /** 浏览器端 QR 模块源码（面板页 `import('/kite/qr.js')` 用）。 */
 const QR_SOURCE = await fsp.readFile(path.join(path.dirname(fileURLToPath(import.meta.url)), 'qr.js'), 'utf8');
+
+/**
+ * 原子写 JSON（tmp + rename + chmod 0600）—— 对齐 identity/device-store.js 的写法。
+ * ★ 为什么不能直接 writeFile：① 进程在写一半时被杀 → 文件半截 → 下次读取回退默认值
+ *   （kill switch 静默失效 / 中继令牌丢失）；② 已存在文件的 `{mode}` 不会被收紧，
+ *   含明文中继令牌的 relay-override.json 可能停在 0644。
+ */
+async function atomicWriteJson(file, obj) {
+  const tmp = `${file}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
+  await fsp.writeFile(tmp, JSON.stringify(obj, null, 1), { mode: 0o600 });
+  await fsp.rename(tmp, file);
+  try {
+    await fsp.chmod(file, 0o600);
+  } catch {
+    /* Windows 忽略 */
+  }
+}
 
 export class KillSwitch {
   #file;
@@ -41,7 +59,7 @@ export class KillSwitch {
   }
   async set(enabled) {
     this.#enabled = enabled === true;
-    await fsp.writeFile(this.#file, JSON.stringify({ enabled: this.#enabled, changedAt: Date.now() }, null, 1), { mode: 0o600 });
+    await atomicWriteJson(this.#file, { enabled: this.#enabled, changedAt: Date.now() });
     return this.#enabled;
   }
 }
@@ -76,7 +94,7 @@ export class RelayOverrideStore {
       relayToken: String(data?.relayToken ?? ''),
       changedAt: Date.now()
     };
-    await fsp.writeFile(this.#file, JSON.stringify(this.#data, null, 1), { mode: 0o600 });
+    await atomicWriteJson(this.#file, this.#data);
     return this.#data;
   }
   async clear() {
@@ -135,13 +153,27 @@ function sendJson(res, status, obj, extraHeaders) {
  * { adapter, killSwitch, devices, pairing, audit, relayStatus(), kickDevice(), probe(), relayPublicUrl(), fingerprint }
  */
 /**
- * 三轨认证（真机结论：桌面 webview 顶层导航不带宿主 cookie；iframe src 带——
+ * 管理面认证 = **来源隔离（⓪）+ 三轨**（真机结论：桌面 webview 顶层导航不带宿主 cookie；iframe src 带——
  * 但为摆脱这个不可控变量，入口 URL 内嵌插件自签引导令牌，兑换后全走自有 cookie）：
+ *   ⓪ 来源隔离：连接器转发来的请求（带 x-kite-via-connector）**一律 403** —— 见下。
  *   ① kite_token（插件签名引导令牌，10 分钟有效，仅授权管理面）→ 兑换 kite-admin cookie
  *   ② kite-admin cookie（连接器密钥签名，12h）→ 直接放行
  *   ③ 宿主 dsh-auth 会话（从「在浏览器打开」进入的场景）→ 放行
+ *
+ * ★ 关于 ⓪：连接器**必然**以已认证的 loopback 身份访问宿主，所以「回环 = 已认证 = 可信」
+ *   在代理场景下失效 —— 若没有 ⓪，任何能经代理触达 `/kite/*` 的请求都会走轨 ③ 进管理面。
+ *   标记值由连接器在白名单重建之后无条件写入（进程级随机），手机既猜不到也拦不住。
  */
 function adminAuth(req, url, deps) {
+  if (deps.viaValue && req.headers?.[VIA_HEADER] === deps.viaValue) {
+    // 审计：这不是普通 401，是「有人试图从远程代理面进管理面」——必须留痕。
+    try {
+      deps.audit?.append?.({ kind: 'admin.proxy-denied', detail: { path: String(url?.pathname ?? '').slice(0, 120) } });
+    } catch {
+      /* 审计失败不影响拒绝 */
+    }
+    return { ok: false, status: 403, body: '管理面不接受经远程代理到达的请求。请在桌面端本机打开。' };
+  }
   // 轨 1：引导令牌（内嵌在注入的入口 URL）。★ 令牌无效/过期不终止判定 ——
   // 它只是「首次兑换」的加速器，不是唯一通路（父页面 fetch 自带宿主 cookie，
   // 轨 3 天然可用；把它写成唯一通路曾导致令牌 10 分钟过期后面板永久 403）。
@@ -152,8 +184,8 @@ function adminAuth(req, url, deps) {
     if (payload && payload.kind === 'kite-bootstrap' && typeof payload.exp === 'number' && payload.exp > Date.now()) {
       return { ok: true, mint: 'bootstrap' };
     }
-    const expected = deps.adapter.launchToken?.();
-    if (expected && safeEqual(token, expected)) return { ok: true, mint: 'bootstrap' };
+    // ★ P2：不再接受宿主 launchToken —— 宿主主令牌不该同时是插件管理面凭据
+    //   （它能开宿主的任意面，泄漏半径远大于本插件；入口令牌已足够）。
     tokenInvalid = true; // 继续往下试其它轨
   }
 
@@ -182,12 +214,6 @@ function adminAuth(req, url, deps) {
   };
 }
 
-function safeEqual(a, b) {
-  const ba = Buffer.from(String(a));
-  const bb = Buffer.from(String(b));
-  return ba.length === bb.length && timingSafeEqual(ba, bb);
-}
-
 function cookieValueOf(headerValue, name) {
   if (typeof headerValue !== 'string') return undefined;
   for (const segment of headerValue.split(';')) {
@@ -200,15 +226,34 @@ function cookieValueOf(headerValue, name) {
 
 const ADMIN_COOKIE = 'kite-admin';
 const ADMIN_COOKIE_MAX_AGE = 12 * 3600;
-/** 引导令牌有效期：面板每次打开都由 /api/entry 实时签发，长有效期只影响「页面停留期间」的可用性。 */
-const BOOTSTRAP_TTL_MS = 24 * 3600 * 1000;
+/** 引导令牌有效期：10 分钟（与注释/README 一致；面板每次打开都由 /api/entry 实时签发，
+ *  注入 HTML 里已不再携带令牌，见 admin/menu-entry.js）。 */
+const BOOTSTRAP_TTL_MS = 10 * 60 * 1000;
 
 export function createAdminHandler(deps) {
   return async function handler(req, res) {
     const url = new URL(req.url ?? '/', 'http://127.0.0.1');
+    /**
+     * ★ 来源隔离必须在**所有**管理面入口之前（含免认证的 /api/entry）。
+     *   /api/entry 是唯一免认证端点（避免「要令牌才能拿令牌」死锁），因此它曾是
+     *   整条管理面上唯一没被来源标记保护的地方 —— 一旦代理侧策略被绕过，
+     *   攻击者能白拿 10 分钟引导令牌。这里把它也纳入 ⓪ 轨。
+     *   本机入口不受影响：标记头只由连接器在白名单重建后写入。
+     */
+    if (deps.viaValue && req.headers?.[VIA_HEADER] === deps.viaValue) {
+      try {
+        deps.audit?.append?.({ kind: 'admin.proxy-denied', detail: { path: String(url?.pathname ?? '').slice(0, 120) } });
+      } catch {
+        /* 审计失败不影响拒绝 */
+      }
+      res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+      res.end('管理面不接受经远程代理到达的请求。请在桌面端本机打开。');
+      return;
+    }
     // ★ /api/entry 必须免认证：它是「获取引导令牌」的端点，若要求认证则形成死锁
     //   （客户端要令牌 → 调 entry → 需要令牌 → 401）。真机事故 2026-09-30。
-    //   安全性：它只返回插件自签的短期令牌，且仅回环可达（宿主路由门 + Host 栅栏）。
+    //   安全性：它只返回插件自签的短期令牌，且仅回环可达（宿主路由门 + Host 栅栏 +
+    //   上面的来源隔离）。
     if (url.pathname.replace(/\/+$/, '') === '/kite/api/entry' && req.method === 'GET') {
       let entryUrl = '/kite';
       try {
@@ -242,12 +287,15 @@ export function createAdminHandler(deps) {
     const route = url.pathname.replace(/\/+$/, '') || '/kite';
     try {
       if (route === '/kite' && req.method === 'GET') {
-        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', ...extraHeaders });
-        res.end(renderAdminHtml());
+        // ★ P2：管理面 HTML 走 CSP（nonce 只放行我们自己的两处内联脚本）+ no-referrer。
+        //   前提是已移除内联 onclick 属性（行内事件处理器不受 nonce 保护，会直接被 CSP 打死）。
+        const nonce = newNonce();
+        res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', ...htmlSecurityHeaders(nonce), ...extraHeaders });
+        res.end(renderAdminHtml(nonce));
         return;
       }
       if (route === '/kite/qr.js' && req.method === 'GET') {
-        res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store' });
+        res.writeHead(200, { 'content-type': 'text/javascript; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
         res.end(QR_SOURCE);
         return;
       }
@@ -289,8 +337,12 @@ export function createAdminHandler(deps) {
         const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
         const { token, expiresAt } = deps.pairing.begin({ name: body.name });
         const base = deps.relayPublicUrl();
+        // ★ P1-3：配对链接带上**连接器公钥**（公钥，放 URL 安全）。手机用它 + 自己本地
+        //   生成的设备公钥独立算出 6 位校验码 —— 中继若偷换设备公钥，两端数字必然不一致。
+        //   这条链接由桌面端面板生成、经扫码/复制进入手机，是校验码唯一可信的输入来源。
+        const connectorPub = deps.keys?.ed25519?.publicB64u ?? '';
         const pairingUrl = base
-          ? `${base}/kite/pair?token=${encodeURIComponent(token)}&name=${encodeURIComponent(body.name || 'phone')}&c=${encodeURIComponent(deps.fingerprint)}`
+          ? `${base}/kite/pair?token=${encodeURIComponent(token)}&name=${encodeURIComponent(body.name || 'phone')}&c=${encodeURIComponent(deps.fingerprint)}${connectorPub ? `&pk=${encodeURIComponent(connectorPub)}` : ''}`
           : null;
         let qrSvg = null;
         if (pairingUrl) {
@@ -330,6 +382,8 @@ export function createAdminHandler(deps) {
       if (route === '/kite/api/killswitch' && req.method === 'POST') {
         const body = JSON.parse((await readBody(req)).toString('utf8') || '{}');
         const enabled = await deps.killSwitch.set(body.enabled === true);
+        // ★ P1-1：真断开 / 真恢复（dispose 在途隧道；恢复走重建 + 锁检查）。
+        await deps.onKillSwitch?.(enabled);
         deps.audit.append({ kind: enabled ? 'killswitch.on' : 'killswitch.off' });
         sendJson(res, 200, { enabled });
         return;
@@ -368,7 +422,7 @@ export function createPairPageHandler(deps) {
         const next = c ? `/?c=${encodeURIComponent(c)}` : '/';
         return {
           status: 302,
-          headers: { location: next, 'cache-control': 'no-store' },
+          headers: { location: next, 'cache-control': 'no-store', 'referrer-policy': 'no-referrer', 'x-content-type-options': 'nosniff' },
           body: Buffer.from('')
         };
       }
@@ -408,11 +462,44 @@ export function createPairPageHandler(deps) {
   };
 }
 
+/** 每响应一个 nonce（CSP 只放行带它的内联脚本）。模板里用占位符，渲染时替换。 */
+const NONCE_PLACEHOLDER = '__KITE_NONCE__';
+function newNonce() {
+  return randomBytes(16).toString('base64');
+}
+function htmlSecurityHeaders(nonce) {
+  return {
+    'referrer-policy': 'no-referrer',
+    'x-content-type-options': 'nosniff',
+    'content-security-policy': [
+      "default-src 'none'",
+      `script-src 'nonce-${nonce}' 'self'`,
+      "style-src 'unsafe-inline'",
+      "connect-src 'self'",
+      "img-src 'self' data:",
+      "font-src 'self' data:",
+      "base-uri 'none'",
+      "form-action 'none'",
+      "frame-ancestors 'none'"
+    ].join('; ')
+  };
+}
+
 function json(status, obj) {
-  return { status, headers: { 'content-type': 'application/json; charset=utf-8' }, body: Buffer.from(JSON.stringify(obj), 'utf8') };
+  return {
+    status,
+    headers: { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' },
+    body: Buffer.from(JSON.stringify(obj), 'utf8')
+  };
 }
 function html(status, inner) {
-  return { status, headers: { 'content-type': 'text/html; charset=utf-8' }, body: Buffer.from(`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DSH Kite · 配对</title><style>${PAIR_CSS}</style></head><body><main>${inner}</main></body></html>`, 'utf8') };
+  const nonce = newNonce();
+  const doc = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DSH Kite · 配对</title><style>${PAIR_CSS}</style></head><body><main>${inner}</main></body></html>`.replaceAll(NONCE_PLACEHOLDER, nonce);
+  return {
+    status,
+    headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store', ...htmlSecurityHeaders(nonce) },
+    body: Buffer.from(doc, 'utf8')
+  };
 }
 
 const PAIR_CSS = `
@@ -437,12 +524,13 @@ function renderPairHtml() {
 <div id="step-code" class="hidden">
   <p>请核对两边显示的校验码一致：</p>
   <div class="code" id="code"></div>
+  <p class="note" id="code-src" style="font-size:.82rem"></p>
   <p>桌面端面板（「远程访问」）应显示同样的 6 位数字。不一致请不要继续。</p>
   <button id="confirm">确认并进入 DSH</button>
 </div>
 <div id="step-done" class="hidden"><p>配对完成，正在进入 DSH…</p>
 <p id="stuck" class="hidden" style="color:#f85149;line-height:1.7">超过 20 秒仍未进入：中继没能把请求送到桌面端（常见于同一中继挂着多个 DSH 实例，或连接器掉线未被清理）。请回桌面端「远程访问」面板确认连接器在线后，<a id="retry-enter" style="color:#58a6ff;cursor:pointer;text-decoration:underline">点此重试</a>。</p></div>
-<script>
+<script nonce="${NONCE_PLACEHOLDER}">
 (async () => {
   const $ = (id) => document.getElementById(id);
   const fail = (msg) => { $('step-doing').classList.add('hidden'); $('step-error').classList.remove('hidden'); $('err').textContent = msg; };
@@ -468,7 +556,27 @@ function renderPairHtml() {
     if (!doneData.ok) return fail(doneData.error || 'complete failed');
     $('step-doing').classList.add('hidden');
     $('step-code').classList.remove('hidden');
-    $('code').textContent = doneData.code;
+    // ★ P1-3：校验码**在本机计算**，不再直接显示服务端回传值。
+    //   算法必须与 identity/pairing.js 的 verificationCode 逐字节一致：
+    //   sha256(devicePubB64 + '|' + connectorPubB64) 取前 3 字节大端 % 1000000，左补零。
+    //   连接器公钥来自配对链接的 pk 参数（桌面端面板生成 → 扫码/复制进入手机，
+    //   中继改不了这段来源）；若中继偷换设备公钥，两端数字必然不一致。
+    //   边界（README 已如实写明）：能改写本页 JS 的中继仍可绕过 —— 那需要 sealed 客户端或局域网直连。
+    const connectorPub = params.get('pk');
+    let shown = null;
+    if (connectorPub) {
+      try {
+        const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(pubB64 + '|' + connectorPub)));
+        const n = ((digest[0] << 16) | (digest[1] << 8) | digest[2]) % 1000000;
+        shown = String(n).padStart(6, '0');
+        $('code-src').textContent = '（本机计算：设备公钥 ‖ 连接器公钥，未经服务端转手）';
+      } catch (e) { shown = null; }
+    }
+    if (shown === null) {
+      shown = doneData.code || '------';
+      $('code-src').textContent = '⚠ 未取得连接器公钥，此码来自服务端，无法防中继替换';
+    }
+    $('code').textContent = shown;
     $('confirm').onclick = () => {
       $('step-code').classList.add('hidden');
       $('step-done').classList.remove('hidden');
@@ -488,8 +596,8 @@ function renderPairHtml() {
 </script>`;
 }
 
-function renderAdminHtml() {
-  return ADMIN_HTML;
+function renderAdminHtml(nonce) {
+  return ADMIN_HTML.replaceAll(NONCE_PLACEHOLDER, nonce ?? '');
 }
 
 const ADMIN_HTML = `<!doctype html>
@@ -514,7 +622,7 @@ pre{background:#0b0e12;border-radius:.6rem;padding:.8rem;font-size:.78rem;max-he
 .note{color:#8b949e;font-size:.85rem;line-height:1.6}
 .hidden{display:none}
 </style></head><body><div class="wrap">
-<div class="row" style="justify-content:space-between;align-items:center"><h1 style="margin:0">DSH Kite · 手机远程</h1><button onclick="location.href='/'">← 返回 DSH</button></div>
+<div class="row" style="justify-content:space-between;align-items:center"><h1 style="margin:0">DSH Kite · 手机远程</h1><button id="btn-home">← 返回 DSH</button></div>
 <div class="card"><div class="row"><span id="relay-badge" class="badge idle">未知</span><span class="mono" id="relay-url"></span></div>
 <div class="note" id="relay-note" style="margin-top:.6rem"></div></div>
 
@@ -555,7 +663,7 @@ pre{background:#0b0e12;border-radius:.6rem;padding:.8rem;font-size:.78rem;max-he
 
 <div class="note" style="margin-top:2rem">前置条件：DSH NEXT 设置需开启「浏览器访问」（Browser Access），否则中继回环请求会被桌面 browser-access 门 403。本机未开任何入站端口。</div>
 </div>
-<script>
+<script nonce="${NONCE_PLACEHOLDER}">
 const $ = (id) => document.getElementById(id);
 async function api(path, opts) { const r = await fetch(path, opts); const d = await r.json().catch(() => ({})); if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status)); return d; }
 function badge(state) {
@@ -576,7 +684,7 @@ async function refresh() {
     else if (s.relay.metrics.lastError) note += ' · 最近错误：' + s.relay.metrics.lastError;
     note += ' · 指纹 ' + (s.fingerprint || '').slice(0, 16);
     $('relay-note').textContent = note;
-    $('dev-rows').innerHTML = s.devices.length ? s.devices.map((d) => '<tr><td>' + esc(d.name) + '</td><td class="mono">' + esc(d.deviceId) + '</td><td>' + new Date(d.pairedAt).toLocaleString() + '</td><td>' + (d.lastActiveAt ? new Date(d.lastActiveAt).toLocaleString() : '-') + '</td><td><button class="danger" onclick="revoke(\\'' + d.deviceId + '\\')">撤销</button></td></tr>').join('') : '<tr><td colspan="5" class="note">暂无设备</td></tr>';
+    $('dev-rows').innerHTML = s.devices.length ? s.devices.map((d) => '<tr><td>' + esc(d.name) + '</td><td class="mono">' + esc(d.deviceId) + '</td><td>' + new Date(d.pairedAt).toLocaleString() + '</td><td>' + (d.lastActiveAt ? new Date(d.lastActiveAt).toLocaleString() : '-') + '</td><td><button class="danger" data-revoke="' + esc(d.deviceId) + '">撤销</button></td></tr>').join('') : '<tr><td colspan="5" class="note">暂无设备</td></tr>';
     // 待配对：倒计时 + 桌面侧校验码（手机提交公钥后出现，用于两端比对）
     const pendingList = s.pairings || [];
     // ★ 配对完成检测（真机反馈 2026-10-02：手机扫码成功后面板滞留「等待手机提交…」，
@@ -608,7 +716,7 @@ async function refresh() {
     $('audit').textContent = (s.audit || []).map((e) => new Date(e.ts).toLocaleTimeString() + ' ' + JSON.stringify(e)).join('\\n') || '（暂无事件）';
   } catch (e) { $('relay-note').textContent = '状态加载失败：' + e.message; }
 }
-function esc(s) { return String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c])); }
+function esc(s) { return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 // ---- 中继接入（可视化配置）：令牌永不回显；探针走临时 connectorId；写入 0600 ----
 let rcData = null;
 const RC_HINT = {
@@ -684,7 +792,14 @@ $('rc-yes').onclick = () => {
     .catch((e) => rcSetMsg('请求失败：' + e.message, true))
     .then(() => { $('rc-yes').disabled = false; });
 };
-window.revoke = async (id) => { await api('/kite/api/devices/' + encodeURIComponent(id), { method: 'DELETE' }); refresh(); };
+// ★ P2：弃用内联 onclick 拼接（行内事件处理器不受 CSP nonce 保护，会被直接打死；
+//   字符串拼接 onclick 也是 XSS 放大器）—— 改为 data 属性 + 事件委托。
+async function revokeDevice(id) { await api('/kite/api/devices/' + encodeURIComponent(id), { method: 'DELETE' }); refresh(); }
+$('dev-rows').addEventListener('click', (event) => {
+  const btn = event.target.closest('[data-revoke]');
+  if (btn) revokeDevice(btn.getAttribute('data-revoke'));
+});
+$('btn-home').onclick = () => { location.href = '/'; };
 $('btn-pair').onclick = async () => {
   const name = $('dev-name').value.trim() || 'phone';
   const d = await api('/kite/api/pairings', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name }) });

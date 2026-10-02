@@ -1,5 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
 import { qrMatrix, pickVersion, buildDataCodewords, VERSION_TABLE, CAPACITY_M } from '../admin/qr.js';
 import { menuEntryRows, CLIENT_SOURCE } from '../admin/menu-entry.js';
 import { deviceCookie } from '../identity/pairing.js';
@@ -112,6 +114,114 @@ test('菜单入口：注入 global(入口URL) + 内联面板客户端脚本', ()
   assert.equal(rows[1].placement, 'body');
   assert.match(rows[1].text, /dsh-ra-menu-entry/);
   assert.match(rows[1].text, /__DSH_KITE_AUTH__/);
+});
+
+/**
+ * 侧栏半包（admin/sidebar-entry.js）的执行夹具。
+ *
+ * 它是经典脚本，必须自行调用 `window.__ModuleLoader__.load({ id: <包名>, factory })`；
+ * 宿主侧 graph row 的 id 取自 Loader 行的包名，arrive() 校验的正是它 —— 所以这里
+ * 用一个假的 __ModuleLoader__ 捕获注册，再手动执行工厂，模拟真实物化过程。
+ */
+function loadSidebarBundle() {
+  const registered = [];
+  const sandbox = {
+    window: { __ModuleLoader__: { load: (reg) => registered.push(reg) } },
+    document: {
+      getElementById: () => null,
+      createElement: () => ({ id: '', textContent: '' }),
+      head: { appendChild: () => {} },
+      documentElement: { appendChild: () => {} }
+    },
+    require: () => {
+      throw new Error('unexpected require');
+    }
+  };
+  const source = readFileSync(new URL('../admin/sidebar-entry.js', import.meta.url), 'utf8');
+  vm.runInNewContext(source, sandbox, { filename: 'admin/sidebar-entry.js' });
+  return { registered, sandbox };
+}
+
+/** 最小 React 替身：只记录元素树，足以断言宽/窄两态的渲染结果。 */
+const reactStub = {
+  createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.filter((c) => c !== null && c !== undefined) })
+};
+
+/** 物化侧栏半包并完成一次槽位注册，返回 { component, calls, sandbox }。 */
+function mountSidebarEntry() {
+  const { registered, sandbox } = loadSidebarBundle();
+  const face = registered[0].factory((spec) => {
+    if (spec === 'react') return reactStub;
+    throw new Error(`unexpected require: ${spec}`);
+  });
+  const calls = [];
+  face.apply({ slots: { inject: (key, cb) => calls.push({ key, cb }), register: (opts, component) => ({ opts, component }) } });
+  return { face, component: calls[0].cb().component, calls, sandbox };
+}
+
+test('侧栏入口：以包名 dsh-kite 注册模块工厂（id 必须是包名，否则宿主报 not-registered）', () => {
+  const { registered } = loadSidebarBundle();
+  assert.equal(registered.length, 1, '恰好注册一个模块');
+  assert.equal(registered[0].id, 'dsh-kite', '注册 id = 包名（graph row id 的来源）');
+  assert.equal(typeof registered[0].factory, 'function');
+});
+
+test('侧栏入口：注册 sidebar.footer.action 槽，order 20 落在上下文洞察（10）下方', () => {
+  const { face, component, calls } = mountSidebarEntry();
+  // 逐元素断言：face 来自 vm 沙箱，其数组原型与宿主 realm 不同，deepStrictEqual 会误报。
+  assert.equal(face.inject.length, 1, '只注入 slots');
+  assert.equal(face.inject[0], 'slots');
+
+  assert.equal(calls.length, 1, '恰好注册一个槽位');
+  assert.equal(calls[0].key, 'sidebar.footer.action', '槽位名 = 侧栏底部 action 槽');
+  const entry = calls[0].cb();
+  assert.equal(entry.opts.name, 'sidebar.footer.action');
+  assert.equal(entry.opts.id, 'kite-entry', 'list 槽必须有 id');
+  assert.equal(entry.opts.order, 20, 'order 必须 > 10（上下文洞察）');
+  assert.ok(!('priority' in entry.opts), '不得改 priority：会遮蔽其它插件的条目');
+  assert.equal(component, entry.component);
+});
+
+test('侧栏入口：宽/窄两态渲染 —— 窄态只出图标且带 aria-label', () => {
+  const { component } = mountSidebarEntry();
+
+  const wide = component({ wide: true });
+  assert.equal(wide.type, 'button');
+  assert.equal(wide.props.className, 'dsh-kite-entry', '宽态用带标签的样式');
+  assert.equal(wide.props['aria-label'], '手机远程访问');
+  assert.equal(wide.children.length, 2, '宽态 = 图标 + 文案');
+  assert.equal(wide.children[1].children[0], '手机远程');
+
+  const rail = component({ wide: false });
+  assert.equal(rail.props.className, 'dsh-kite-entry dsh-kite-entry-rail', '窄态退化为 36px 圆形');
+  assert.equal(rail.children.length, 1, '窄态只出图标');
+  assert.equal(rail.props['aria-label'], '手机远程访问', '窄态仍可被读屏定位');
+});
+
+test('侧栏入口：点击三级回退，且绝不做顶层导航', () => {
+  const { component, sandbox } = mountSidebarEntry();
+
+  // ① 优先调用 panel-client 暴露的全局
+  let opened = 0;
+  sandbox.window.__DSH_KITE_OPEN__ = () => { opened += 1; };
+  component({ wide: true }).props.onClick();
+  assert.equal(opened, 1, '① 全局存在时优先走它');
+
+  // ② 全局缺失 → 退化为点击右下角悬浮按钮
+  let clicked = 0;
+  sandbox.document.getElementById = (id) => (id === 'dsh-ra-menu-entry' ? { click: () => { clicked += 1; } } : null);
+  delete sandbox.window.__DSH_KITE_OPEN__;
+  component({ wide: true }).props.onClick();
+  assert.equal(clicked, 1, '② 全局缺失时点击悬浮按钮');
+
+  // ③ 两者都不可用 → 静默，不抛错
+  sandbox.document.getElementById = () => null;
+  assert.doesNotThrow(() => component({ wide: true }).props.onClick(), '③ 全不可用时静默');
+
+  // 源码级：任何情况下都不得顶层导航（webview 顶层导航不带宿主 cookie → 401 白页）
+  const code = stripComments(readFileSync(new URL('../admin/sidebar-entry.js', import.meta.url), 'utf8'));
+  assert.doesNotMatch(code, /location\.href\s*=/, '不得做顶层导航');
+  assert.doesNotMatch(code, /location\.assign|location\.replace|window\.open/, '不得用导航或 popup');
 });
 
 /** 去掉注释行后再断言，避免注释里的历史教训文本造成误报。 */

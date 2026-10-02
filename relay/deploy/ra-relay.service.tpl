@@ -22,6 +22,17 @@ Restart=always
 RestartSec=3
 TimeoutStopSec=10
 
+# --- 资源上限（2026-10-02 审查）---------------------------------------------
+# ★ 中继是单进程 Node：连接器跑在【用户自己的机器】上，但中继侧要为每条挂起的
+#   请求/桥保留缓冲（MAX_PHONE_BUFFER_BYTES 8 MiB/桥、MAX_BODY_BYTES 8 MiB/请求），
+#   所以「内存放大」的账单最终打在用户机器上（同一条隧道两端一起涨）。
+#   给中继一个硬上限：最坏情况它只死自己（Restart=always 会拉起），
+#   而不是把同机其他服务一起拖进 OOM。512M 对单进程转发足够（常态几十 MB）。
+#   TasksMax 一并收口：Node 线程 + libuv 线程池正常在两位数以内，256 是宽裕的上限，
+#   防止异常路径下线程/任务数失控。
+MemoryMax=512M
+TasksMax=256
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=ra-relay

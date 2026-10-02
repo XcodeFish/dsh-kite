@@ -4,16 +4,27 @@
 import { readFileSync } from 'node:fs';
 
 const { loadConnectorKeys } = await import('../identity/keys.js');
-const DATA = process.env.HOME + '/.dsh/plugin-data/dsh-kite/default';
+const DATA = `${process.env.DSH_HOME ?? `${process.env.HOME}/.dsh`}/plugin-data/dsh-kite/${process.env.DSH_PROFILE ?? 'default'}`;
+let deviceData;
+try {
+  deviceData = JSON.parse(readFileSync(DATA + '/devices.json', 'utf8'));
+} catch {
+  console.log(`[SKIP] 未找到设备数据：${DATA}/devices.json（需要真实配对环境）`);
+  process.exit(0);
+}
+if (!Array.isArray(deviceData.devices) || deviceData.devices.length === 0) {
+  console.log('[SKIP] 尚无已配对设备，无法验证浏览器资源路由（先扫码配对）');
+  process.exit(0);
+}
 const keys = await loadConnectorKeys(DATA);
 
 // connectorId 从数据目录的连接器公钥动态推导（不硬编码本机凭据）
 const { createHash } = await import('node:crypto');
 const FP = createHash('sha256').update(Buffer.concat([keys.ed25519.publicRaw, keys.x25519.publicRaw])).digest('hex').slice(0, 32);
-const dev = JSON.parse(readFileSync(DATA + '/devices.json', 'utf8')).devices[0];
+const dev = deviceData.devices[0];
 const ticket = keys.signPayload({ deviceId: dev.deviceId, iat: Date.now(), exp: Date.now() + 3600_000 });
 const cookie = 'ra-device=' + ticket;
-const C = '${FP}';
+const C = FP;
 const BASE = 'http://127.0.0.1:8787';
 
 // ① 首次导航：带 c（浏览器地址栏）

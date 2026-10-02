@@ -16,7 +16,14 @@ import { fileURLToPath } from 'node:url';
 
 const CLIENT_SOURCE = await fsp.readFile(path.join(path.dirname(fileURLToPath(import.meta.url)), 'panel-client.js'), 'utf8');
 
-/** 注入行：global(入口URL，含 kite-bootstrap 令牌) + script(内联面板客户端)。 */
+/**
+ * 注入行：global(面板入口 URL，**不含任何令牌**) + script(内联面板客户端)。
+ *
+ * ★ P1-4：注入面是 DSH 首页，而首页同样会经代理下发给手机 —— 这里**绝不能**放
+ *   管理面凭据（曾经放的是 24h 引导令牌）。面板打开时由 panel-client 调
+ *   `/kite/api/entry` 现取（该端点免认证、仅回环可达）。
+ *   `authedUrl` 仅作为显式覆盖保留（测试与定制场景），生产调用不传。
+ */
 export function menuEntryRows({ authedUrl } = {}) {
   return [
     {

@@ -496,8 +496,23 @@
       host.appendChild(b);
     }
 
-    if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', makeButton, { once: true });
-    else makeButton();
+    /**
+     * 供侧栏入口（admin/sidebar-entry.js）调用：把面板打开函数暴露到 window。
+     * 幂等赋值；面板客户端若未注入，侧栏入口自行回退（点击悬浮按钮 → 静默）。
+     */
+    window.__DSH_KITE_OPEN__ = openPanel;
+
+    /**
+     * 悬浮按钮显隐：由 index.js 注入的 __DSH_KITE_ENTRY__.floating 决定。
+     * 全局缺失时 fail-open（floating !== false → 显示），保证旧行为与既有 e2e 不受影响。
+     * ★ 面板引擎（本脚本）与入口按钮是两件事：'sidebar' 模式下仍注入本脚本（面板要能打开），
+     *   只是不建悬浮按钮。
+     */
+    var entryCfg = (window.__DSH_KITE_ENTRY__ && typeof window.__DSH_KITE_ENTRY__ === 'object') ? window.__DSH_KITE_ENTRY__ : {};
+    if (entryCfg.floating !== false) {
+      if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', makeButton, { once: true });
+      else makeButton();
+    }
   } catch (e) {
     /* 入口失败绝不影响 GUI */
   }

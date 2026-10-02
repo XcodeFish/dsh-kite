@@ -61,6 +61,13 @@ export PORT=443
 node server.mjs        # 建议配 systemd（Restart=always）
 ```
 
+> ⚠ **从旧版升级的迁移点（2026-10-02 加固）**：中继启动改为 **fail-closed** ——
+> `RELAY_TOKENS` 为空且未显式 `ALLOW_OPEN=1` 时**拒绝启动**（旧行为是静默放行一切）。
+> 若你原先以 OPEN 模式跑在公网上，升级后重启会失败：这是**预期行为**，请先配好
+> `RELAY_TOKENS`（并同步到插件 `relayToken`）再启动；仅本机联调可用 `ALLOW_OPEN=1`。
+> 同时 `/metrics` 现在需要携带同一令牌（`Authorization: Bearer <token>` 或 `?token=`），
+> 否则回 404 —— Prometheus 抓取配置需相应更新。
+
 ### 2c. 临时隧道（验证用，不适合日常）
 
 ```bash

@@ -20,7 +20,7 @@
 import { promises as fsp } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import { hostAdapter } from './host-adapter.js';
 import { loadConnectorKeys } from './identity/keys.js';
@@ -35,6 +35,7 @@ import { acquireRelayOwnerLock } from './transport/owner-lock.js';
 import { registerApprovalAudit } from './approvals/responders.js';
 import { createAdminHandler, createPairPageHandler, KillSwitch, RelayOverrideStore } from './admin/panel.js';
 import { menuEntryRows } from './admin/menu-entry.js';
+import { applyMobileSkin } from './admin/mobile-skin.js';
 
 export const name = 'kite';
 export const inject = ['webServer'];
@@ -83,6 +84,29 @@ export async function migrateLegacyDataDir(dataDir, config, logger) {
  *  env (DSH_KITE_RELAY_URL/_TOKEN) > relay-override.json（面板写入）> patch > 默认值。
  *  面板覆盖排在 patch 之上：插件数据目录是插件唯一完全拥有的配置面（§5.1）。
  *  返回 __sources 供面板显示每个字段的实际生效来源。 */
+/**
+ * 「手机远程」入口位置解析。
+ *
+ *   true / 'both' / 未知值 → 侧栏槽位 + 右下角悬浮按钮（默认）
+ *   'sidebar'              → 仅侧栏槽位（侧栏收起时自动退化为圆形图标）
+ *   'floating'             → 仅右下角悬浮按钮（旧行为）
+ *   false / 'off'          → 两者都不注入（面板仍可直接访问 /kite）
+ *
+ * ★ 侧栏槽位由 dsh.client web 半包（admin/sidebar-entry.js）自行注册，不需要宿主注入；
+ *   宿主在这里只决定「悬浮按钮是否显示」与「面板引擎是否注入」。二者必须解耦：
+ *   'sidebar' 模式下**仍要**注入 panel-client（否则侧栏按钮点了没有面板可开），
+ *   只是不建悬浮按钮。
+ *
+ * @param {unknown} value - patch 层 config.menuEntry
+ * @returns {{floating: boolean, sidebar: boolean}}
+ */
+export function parseMenuEntry(value) {
+  if (value === false || value === 'off' || value === 'none') return { floating: false, sidebar: false };
+  if (value === 'floating') return { floating: true, sidebar: false };
+  if (value === 'sidebar') return { floating: false, sidebar: true };
+  return { floating: true, sidebar: true };
+}
+
 export function readConfig(config, override) {
   const cfg = config && typeof config === 'object' ? config : {};
   const num = (value, fallback, min, max) => {
@@ -111,7 +135,8 @@ export function readConfig(config, override) {
     allowedAgentPresets: Array.isArray(cfg.allowedAgentPresets) ? cfg.allowedAgentPresets.map(String) : ['default'],
     allowTerminal: cfg.allowTerminal === true,
     allowUpload: cfg.allowUpload === true,
-    menuEntry: cfg.menuEntry !== false,
+    menuEntry: parseMenuEntry(cfg.menuEntry),
+    mobileSkin: cfg.mobileSkin !== false,
     pairingTtlSeconds: num(cfg.pairingTtlSeconds, 120, 30, 3600),
     ticketTtlHours: num(cfg.ticketTtlHours, 12, 1, 24 * 30),
     dataDir: cfg.dataDir,
@@ -135,6 +160,11 @@ export function apply(ctx, config) {
   const audit = new AuditLog(dataDir, logger);
   const killSwitch = new KillSwitch(dataDir);
   const relayOverride = new RelayOverrideStore(dataDir);
+  /**
+   * ★ P0-4 来源标记值：进程级随机。连接器把它写进每个转发请求（白名单过滤之后），
+   * 管理面见到它就 403。手机猜不到值，也无法阻止它被写入 —— 用结构而不是检查来保证。
+   */
+  const viaValue = randomUUID();
 
   // 立即挂管理面（未就绪时 API 返回 starting），避免面板路径与其它插件撞车窗口。
   let deps = null;
@@ -157,29 +187,22 @@ export function apply(ctx, config) {
   });
 
   /**
-   * 入口 URL：内嵌插件自签的短期引导令牌（10 分钟，仅授权管理面；不暴露宿主启动令牌）。
-   * keys 在 boot 完成后才就绪，就绪前退回宿主会话轨。
+   * Web GUI 入口（「手机远程」悬浮按钮）：与官方 client-ui-* 插件同通道注入 boot HTML。
+   * ★ P1-4：注入的 global **不含任何令牌** —— 这段 HTML 同样会经代理下发给手机，
+   *   把管理面凭据放进「必然发给不可信端」的载荷里等于自毁防线。面板打开时由
+   *   panel-client 调 `/kite/api/entry` 现取（免认证、仅回环可达；父上下文 fetch 自带宿主 cookie）。
    */
-  let keysRef = null;
-  const buildMenuUrl = () => {
-    try {
-      if (keysRef) {
-        const now = Date.now();
-        const token = keysRef.signPayload({ kind: 'kite-bootstrap', iat: now, exp: now + 24 * 3600 * 1000 });
-        return `/kite?kite_token=${encodeURIComponent(token)}`;
-      }
-    } catch {
-      /* 签名失败 → 退回宿主会话轨 */
-    }
-    return '/kite';
-  };
-
-  // Web GUI 入口（「手机远程」悬浮按钮）：与官方 client-ui-* 插件同通道注入 boot HTML。
   let disposeMenuEntry;
-  if (cfg.menuEntry && typeof ctx.on === 'function') {
+  const entry = cfg.menuEntry;
+  // 面板引擎（panel-client.js）在「任一入口开启」时都必须注入：它同时提供浮层装配、
+  // 认证与 window.__DSH_KITE_OPEN__（侧栏按钮的调用目标）。
+  if ((entry.floating || entry.sidebar) && typeof ctx.on === 'function') {
     try {
       disposeMenuEntry = ctx.on('webserver/index-inject', (table) => {
-        if (Array.isArray(table)) table.push(...menuEntryRows({ authedUrl: buildMenuUrl() }));
+        if (!Array.isArray(table)) return;
+        // 入口模式全局：panel-client 据此决定是否建右下角悬浮按钮（缺失时 fail-open）。
+        table.push({ kind: 'global', name: '__DSH_KITE_ENTRY__', value: { floating: entry.floating, sidebar: entry.sidebar } });
+        table.push(...menuEntryRows());
       });
     } catch (error) {
       logger?.warn?.(`[kite] menu entry inject failed (panel still available at /kite): ${error.message}`);
@@ -202,7 +225,6 @@ export function apply(ctx, config) {
     for (const field of ['relayUrl', 'relayToken', 'relayPublicUrl']) cfg[field] = effective[field];
     cfg.__sources = effective.__sources;
     const devices = await new DeviceStore(dataDir, logger).load();
-    keysRef = keys; // 入口令牌签名用（注入回调触发时读取）
     const tickets = createTicketService(keys, cfg.ticketTtlHours * 3600_000, logger);
     const policy = createPolicy(cfg);
     const credential = new LoopbackCredential(adapter, logger);
@@ -232,7 +254,11 @@ export function apply(ctx, config) {
         keys,
         audit: (entry) => audit.append(entry),
         logger,
+        viaValue,
         isKilled: () => killSwitch.enabled,
+        // 移动端自适应层（方案 v4）：readConfig 白名单里的 mobileSkin（缺省 true）为真时，
+        // 对手机侧 text/html 注入元素级修补 CSS（见 admin/mobile-skin.js）；false 一键关闭。
+        mobileSkin: cfg.mobileSkin ? applyMobileSkin : null,
         handlePairPage: (...args) => live.pairPage(...args)
       });
       return { pairing, pairPage, relay };
@@ -310,6 +336,18 @@ export function apply(ctx, config) {
       adapter,
       killSwitch,
       devices,
+      viaValue,
+      // ★ P1-1：kill switch 必须真的断开在途隧道 —— 只写文件不算安全开关。
+      //   恢复走「重建 + 过锁检查」，与 applyRelayOverride 同一套流程（避免第二套状态机）。
+      onKillSwitch: async (enabled) => {
+        if (enabled) {
+          live.pairing.abortAll();
+          live.relay.dispose();
+          return;
+        }
+        live = buildLive();
+        startRelayIfAllowed(live.relay);
+      },
       // 面板改配置会整体重建 pairing —— 走转发门面，路由层永远摸到当前实例。
       pairing: {
         begin: (...args) => live.pairing.begin(...args),

@@ -100,7 +100,7 @@ async function handleHttp(streamId, s) {
 // ---- 配对链接 ----
 const base = `http://127.0.0.1:${relayPort}`;
 const { token } = pairing.begin({ name: '我的手机' });
-const pairUrl = `${base}/kite/pair?token=${encodeURIComponent(token)}&name=${encodeURIComponent('我的手机')}&c=${encodeURIComponent(CONNECTOR_ID)}`;
+const pairUrl = `${base}/kite/pair?token=${encodeURIComponent(token)}&name=${encodeURIComponent('我的手机')}&c=${encodeURIComponent(CONNECTOR_ID)}&pk=${encodeURIComponent(keys.ed25519.publicB64u)}`;
 console.log(`配对链接: ${pairUrl.slice(0, 96)}…`);
 
 // ★ 场景：裸访问根路径（用户 21:35 的情况）—— 必须给出可自助的指引，而非仅「未就绪」
@@ -129,7 +129,7 @@ const withC = await fetch(`${base}/kite/pair/begin?c=${encodeURIComponent(CONNEC
 check('中继：POST 带 c → 到达插件（JSON 响应）', (withC.headers.get('content-type') || '').includes('application/json'), `status=${withC.status}`);
 
 // ---- 无头 Chrome 走完整配对 ----
-const chrome = spawn(CHROME, ['--headless=new', `--remote-debugging-port=${CDP_PORT}`, '--no-first-run', '--no-default-browser-check', '--user-data-dir=' + path.join(os.tmpdir(), 'ra-pair-chrome-' + Date.now()), '--window-size=430,900', 'about:blank'], { stdio: 'ignore' });
+const chrome = spawn(CHROME, ['--no-sandbox', '--headless=new', `--remote-debugging-port=${CDP_PORT}`, '--no-first-run', '--no-default-browser-check', '--user-data-dir=' + path.join(os.tmpdir(), 'ra-pair-chrome-' + Date.now()), '--window-size=430,900', 'about:blank'], { stdio: 'ignore' });
 for (let i = 0; i < 60; i += 1) { try { if ((await fetch(`http://127.0.0.1:${CDP_PORT}/json/version`)).ok) break; } catch {} await new Promise((r) => setTimeout(r, 250)); }
 const targets = await (await fetch(`http://127.0.0.1:${CDP_PORT}/json/list`)).json();
 const ws = new WebSocket(targets.find((t) => t.type === 'page').webSocketDebuggerUrl);
@@ -148,6 +148,10 @@ check('★无 JSON 解析错误（用户故障已修）', !String(pageText).incl
 check('页面无 JS 异常', pageErrors.length === 0, pageErrors.slice(0, 1).join(''));
 const code = await evaluate("document.getElementById('code') && document.getElementById('code').textContent");
 check('6 位校验码显示', /^\d{6}$/.test(String(code)), String(code));
+// ★ P1-3：链接带 &pk= 时必须走**手机本地计算**，页面要明确标注「本机计算」——
+//   若退化成服务端回传值，校验码就重新变成「连接器跟自己对账」，中继偷换公钥不可见。
+const codeSrc = await evaluate("document.getElementById('code-src') && document.getElementById('code-src').textContent");
+check('★校验码为手机本地计算（非服务端回传）', /本机计算/.test(String(codeSrc)), String(codeSrc));
 const devicesAfter = devices.list();
 check('设备已入库 ACL', devicesAfter.length === 1, `devices=${devicesAfter.length}`);
 if (devicesAfter.length === 1) {

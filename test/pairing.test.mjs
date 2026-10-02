@@ -8,7 +8,7 @@ import { createTicketService } from '../identity/ticket.js';
 import { DeviceStore } from '../identity/device-store.js';
 import { createPairingService, verificationCode, PairingError, deviceCookieFrom, deviceCookie } from '../identity/pairing.js';
 import { newChallenge } from '../identity/ticket.js';
-import { generateKeyPairSync, sign } from 'node:crypto';
+import { createHash, generateKeyPairSync, randomBytes, sign } from 'node:crypto';
 import { b64e } from '../transport/frames.js';
 
 async function fixture() {
@@ -111,4 +111,40 @@ test('配对：abortAll 清空未完成会话', async () => {
   pairing.begin({});
   assert.equal(pairing.abortAll(), 2);
   assert.equal(pairing.pendingCount(), 0);
+});
+
+test('★ 校验码：手机侧本地算法必须与服务端逐字节一致（P1-3 防中继抢配的前提）', () => {
+  // 浏览器实现（admin/panel.js 配对页内联脚本）：sha256(devicePubB64 + '|' + connectorPubB64)
+  //   取前 3 字节大端 % 1000000，左补零。这里用 Node 复刻同一算法做交叉验证 ——
+  //   两处一旦分叉，「两端比对」就退化成「连接器跟自己对账」，中继偷换设备公钥不会被发现。
+  const browserSide = (devicePubB64, connectorPubB64) => {
+    const digest = createHash('sha256').update(`${devicePubB64}|${connectorPubB64}`).digest();
+    const n = ((digest[0] << 16) | (digest[1] << 8) | digest[2]) % 1_000_000;
+    return String(n).padStart(6, '0');
+  };
+  const samples = [
+    [b64e(Buffer.from('a'.repeat(32))), 'connector-pub-key-b64u'],
+    [b64e(randomBytes(32)), ''],
+    [b64e(randomBytes(32)), b64e(randomBytes(32))],
+    ['AAAA', 'BBBB']
+  ];
+  for (const [dev, conn] of samples) {
+    assert.equal(browserSide(dev, conn), verificationCode(dev, conn), `两侧算法分叉：${dev}|${conn}`);
+  }
+});
+
+test('★ 幽灵设备：提交公钥但未完成挑战签名，不得写进设备表（P2）', async () => {
+  const { pairing, store } = await fixture();
+  const { token } = pairing.begin({ name: 'ghost' });
+  const device = deviceKeypair();
+  const submitted = await pairing.submit({ token, pubKey: device.pubB64, name: 'ghost' });
+  assert.ok(submitted.deviceId, '配对挑战应正常签发');
+  assert.equal(store.get(submitted.deviceId), undefined, '未验签前不得落 ACL（否则面板出现永远连不上的幽灵条目）');
+
+  await assert.rejects(
+    () => pairing.complete({ challenge: submitted.challenge, sig: 'not-a-signature', ts: Date.now() }),
+    /挑战验证失败/
+  );
+  assert.equal(store.get(submitted.deviceId), undefined, '验签失败同样不得留下设备条目');
+  assert.equal(store.list().length, 0, '设备表必须保持干净');
 });

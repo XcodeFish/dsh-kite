@@ -51,7 +51,9 @@ async function health() {
 }
 
 async function metricsText() {
-  return await (await fetch(`http://127.0.0.1:${port}/metrics`)).text();
+  // ★ /metrics 现在要求有效令牌（P1-2：公网端口不得裸奔）。用 Authorization 头而非
+  //   ?token= —— query 会进 Caddy/前置代理的访问日志，头不会。
+  return await (await fetch(`http://127.0.0.1:${port}/metrics`, { headers: { authorization: `Bearer ${TOKEN}` } })).text();
 }
 
 function connectConnector(id = 'test-connector') {

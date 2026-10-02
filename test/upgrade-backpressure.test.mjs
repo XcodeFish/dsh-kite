@@ -89,7 +89,8 @@ test('上行桥：背压下不重复、不乱序（按帧解析比 payload 序�
   const payloads = [];
   const bridge = openLoopbackBridge(deps, {
     streamId: 's1',
-    path: '/api/remote.mux',
+    pathname: '/api/remote.mux',
+    search: '',
     onReady: () => {},
     onFrame: () => {},
     onClose: () => {}
@@ -131,7 +132,8 @@ test('上行桥：升级完成前的积压帧会全部放行，不会滞留', as
   };
   const bridge = openLoopbackBridge(deps, {
     streamId: 's2',
-    path: '/api/remote.mux',
+    pathname: '/api/remote.mux',
+    search: '',
     onReady: () => {},
     onFrame: () => {},
     onClose: () => {}

@@ -73,7 +73,7 @@ async function runBridge(frames) {
   const bridge = openLoopbackBridge(
     { credential: { acquire: async () => ({ base: `http://127.0.0.1:${port}`, cookie: 'dsh-auth-x=1' }) },
       logger: { warn: () => {} }, audit: () => {} },
-    { streamId: 'frag-1', path: '/api/remote.mux', onReady: () => {}, onFrame: (m) => seen.push(m), onClose: () => {} }
+    { streamId: 'frag-1', pathname: '/api/remote.mux', search: '', onReady: () => {}, onFrame: (m) => seen.push(m), onClose: () => {} }
   );
   await new Promise((resolve) => setTimeout(resolve, 500));
   bridge.close();

@@ -15,8 +15,20 @@
         # 远程终端写类方法与上传默认拒绝（true=放行，需在手机上二次确认的场景由策略层记审计）。
         allowTerminal: false
         allowUpload: false
-        # DSH Web GUI 右下角「手机远程」入口（webserver/index-inject 注入；false 关闭）。
-        menuEntry: true
+        # 「手机远程」入口位置（两种入口互相独立，可任意组合）：
+        #   'sidebar'  仅左侧栏槽位（默认；与「上下文洞察」并列，侧栏收起时退化为 36px 圆形图标）
+        #   'both'     左侧栏槽位 + 右下角悬浮按钮
+        #   'floating' 仅右下角悬浮按钮（旧行为）
+        #   false      两者都不注入（面板仍可直接访问 /kite）
+        # 侧栏入口走 dsh.client web 半包（admin/sidebar-entry.js，槽位 sidebar.footer.action）。
+        # 悬浮按钮走 webserver/index-inject（admin/menu-entry.js，内联 panel-client.js）。
+        # 注意：'sidebar' 模式下**仍会**注入 panel-client（面板引擎 + 认证 + __DSH_KITE_OPEN__），
+        # 只是不建悬浮按钮 —— 入口与面板解耦，去掉按钮不会让侧栏条目变成死键。
+        menuEntry: 'sidebar'
+        # 移动端自适应层（方案 v4）：仅代理链路对 text/html 文档注入 @media(max-width:1023.9px)
+        # 的元素级修补（消息列宽 token、触控目标 ≥44px、输入 16px 防 iOS 缩放、safe-area、
+        # 代码/表格横向滚动）。不改变任何交互/结构；false 一键关闭。桌面 LAN 直连不经反代，零影响。
+        mobileSkin: true
         # 配对码有效期（秒）与票据有效期（小时）。
         pairingTtlSeconds: 120
         ticketTtlHours: 12

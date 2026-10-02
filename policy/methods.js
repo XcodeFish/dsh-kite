@@ -37,6 +37,10 @@ export class Policy {
    * 判定一个透传 HTTP 请求。返回：
    * { action:'allow' } | { action:'deny', status, reason } | { action:'rewrite', body }
    * （rewrite 仅 session/create，见 presets.js；调用方先经本方法再走重写。）
+   *
+   * ★ path 必须是 canonicalizeTarget(...).key（P0-1）—— 传原始串等于把两次解析的
+   *   差异重新引回来：`/./kite/api/x` 不命中保留前缀，`new URL` 之后却会打到管理面。
+   *   WS 侧（transport/relay-client.js 的 ws-open）走同一道门，不是后门。
    */
   decide({ method = 'GET', path: rawPath, body }) {
     const method_ = String(method).toUpperCase();
@@ -103,18 +107,62 @@ function deny(status, reason) {
   return { action: 'deny', status, reason };
 }
 
-/** 请求行是否可安全透传（只允许 http(s) 的 path+query 形态）。 */
-export function safeProxyPath(path, limit = 8192) {
-  if (typeof path !== 'string' || path.length === 0 || path.length > limit) return false;
-  if (!path.startsWith('/')) return false;
-  if (path.includes(' ') || path.includes('\\')) return false;
-  // ★ 逗号是合法路径字符：DSH 用 /plugins/??a/client.js,b/client.js 形式批量加载
-  //   客户端模块（真机事故 2026-09-30：旧的宽松校验把逗号当非法 → 400 → 前端加载失败）。
-  // 拒绝伪装成 absolute-form 的请求目标与控制字符。
-  if (/^https?:\/\//i.test(path)) return false;
+/**
+ * 规范化基准 origin：固定、不可路由，只用来让 URL 解析器做一次归一化。
+ * 与真实 loopback origin 无关 —— 出站组装会把 pathname/search 贴到受信 origin 上（proxy/reverse-proxy.js）。
+ */
+const CANON_ORIGIN = 'http://kite.invalid';
+
+/**
+ * ★ 唯一收口（P0-1，安全审查终审报告 §1）：请求目标字符串 → origin-form 的 { pathname, search, key }。
+ *
+ * 根因：判定看原始串、发送用 `new URL(raw, base)` 的结果 —— 两次解析之间的映射差异
+ * （点段折叠 `/./`、`/x/../`、`%2e`，authority 切换 `//host`）就是全部 Critical 绕过面。
+ * 修法只有一条：**只解析一次**，判定 / 审计 / 出站组装共用这一个返回值。
+ *
+ * 返回 null = 直接 400（不可代理）。
+ */
+export function canonicalizeTarget(rawTarget, limit = 8192) {
+  if (typeof rawTarget !== 'string' || rawTarget.length === 0 || rawTarget.length > limit) return null;
+  // 必须 origin-form：恰好一个前导 '/'（'//' 是 protocol-relative，会切 authority）
+  if (rawTarget[0] !== '/' || rawTarget[1] === '/') return null;
+  if (rawTarget.includes(' ') || rawTarget.includes('\\') || rawTarget.includes('#')) return null;
   // eslint-disable-next-line no-control-regex
-  if (/[\u0000-\u001f\u007f]/.test(path)) return false;
-  return true;
+  if (/[\u0000-\u001f\u007f]/.test(rawTarget)) return null;
+  let url;
+  try {
+    url = new URL(rawTarget, CANON_ORIGIN);
+  } catch {
+    return null;
+  }
+  // authority 被改写（//host、http://host、\host 之类的变体）→ 一律拒
+  if (url.origin !== CANON_ORIGIN) return null;
+  // pathname 里出现百分号编码的 / \ . 与控制字符：URL 只折叠 %2e，%2f/%5c 会原样透给宿主，
+  // 宿主若再做一次 decode 就又是一次「判定/发送」差异。这些字节在 DSH 的 pathname 里无合法用途。
+  const ENCODED_STRUCTURAL = /%(2f|5c|2e|0[0-9a-f]|1[0-9a-f]|7f)/i;
+  if (ENCODED_STRUCTURAL.test(url.pathname)) return null;
+  // ★ 双编码（`%252e`）：URL 不会折叠它，本层判定也看不见点段 —— 但宿主若解码两次
+  //   就会重新出现 `/kite/...`。这里只对「含 %25」的少数写法做一次额外解码检查：
+  //   解一次后若仍暴露编码的点/斜杠/反斜杠，说明是刻意双编码 → 拒。
+  if (/%25/i.test(url.pathname)) {
+    let once;
+    try {
+      once = decodeURIComponent(url.pathname);
+    } catch {
+      return null;
+    }
+    if (ENCODED_STRUCTURAL.test(once) || once.includes('\\')) return null;
+  }
+  return { pathname: url.pathname, search: url.search, key: `${url.pathname}${url.search}` };
+}
+
+/**
+ * 兼容保留：现有测试与调用方只关心「是否可代理」。
+ * ★ 但它只回答「能不能代理」，**不回答「会不会打到别处」** —— 新代码请直接用
+ *   canonicalizeTarget 的返回值（判定/审计/出站同源）。
+ */
+export function safeProxyPath(path, limit = 8192) {
+  return canonicalizeTarget(path, limit) !== null;
 }
 
 export function createPolicy(cfg) {

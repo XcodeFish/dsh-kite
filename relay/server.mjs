@@ -17,14 +17,18 @@
  * 环境变量：
  *   PORT                监听端口（默认 8787）
  *   TLS_KEY / TLS_CERT  PEM 路径（生产必配；或前置 caddy/nginx 终结 TLS）
- *   RELAY_TOKENS        逗号分隔接入令牌（空 = 开放，仅限本地开发）
+ *   RELAY_TOKENS        逗号分隔接入令牌（必配；为空时必须显式 ALLOW_OPEN=1 才启动）
+ *   ALLOW_OPEN          显式开放模式（=1 时无令牌放行一切；仅限本机联调，生产禁止）
  *   MAX_DEVICES         单连接器设备上限（默认 8）
  *   MAX_PHONE_PER_DEVICE 单设备并发手机 socket 上限（默认 4）
+ *   RELAY_RATE_CONNECTOR_PER_MIN  /connector 升级限流（默认 60/min/IP）
+ *   RELAY_RATE_PAIR_PER_MIN       配对端点（/kite/pair*）限流（默认 60/min/IP）
+ *   RELAY_RATE_PHONE_PER_MIN      其余手机 HTTP/WS 限流（默认 600/min/IP）
  */
 import http from 'http';
 import https from 'https';
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { randomUUID, createHash, verify as edVerify, createPublicKey, KeyObject } from 'node:crypto';
+import { readFileSync, writeFileSync, mkdirSync, writeSync } from 'node:fs';
+import { randomUUID, createHash, verify as edVerify, createPublicKey, KeyObject, timingSafeEqual } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import { gzipSync } from 'node:zlib';
 
@@ -113,6 +117,25 @@ process.on('unhandledRejection', (err) => console.error('[ra-relay] unhandled re
 
 const PORT = Number(process.env.PORT || 8787);
 const RELAY_TOKENS = new Set(String(process.env.RELAY_TOKENS ?? '').split(',').map((s) => s.trim()).filter(Boolean));
+/**
+ * ★ fail-closed 启动闸门（2026-10-02 审查）。
+ *   旧实现：RELAY_TOKENS 为空 = 静默放行一切（含 /connector 升级与全部手机路由），
+ *   只在启动日志末尾用一行小字写着「OPEN」。一次 env 漏配就足以把中继变成公网
+ *   开放代理，而失败模式是无声的 —— 这正是审查里最该先堵的一处。
+ *   新语义：无令牌属于【必须显式选择】的开发模式（ALLOW_OPEN=1），否则拒绝启动。
+ *   用 writeSync(2) 而非 console.error：管道上的 stderr 写入是异步的，
+ *   紧跟 process.exit(1) 会把错误信息截断（验收测试正是断言 stderr 内容）。
+ */
+const ALLOW_OPEN = process.env.ALLOW_OPEN === '1';
+if (RELAY_TOKENS.size === 0 && !ALLOW_OPEN) {
+  const message = [
+    '[ra-relay] 启动中止：RELAY_TOKENS 为空，且未显式设置 ALLOW_OPEN=1。',
+    '  · 本机联调：ALLOW_OPEN=1 node relay/server.mjs（该模式放行一切，仅限本机/回环，勿用于生产）。',
+    '  · 生产部署：必须配置 RELAY_TOKENS（逗号分隔的接入令牌）；install.sh 会写入 /etc/ra-relay/env。'
+  ].join('\n') + '\n';
+  try { writeSync(2, message); } catch { console.error(message); }
+  process.exit(1);
+}
 const MAX_DEVICES = Number(process.env.MAX_DEVICES || 8);
 const MAX_PHONE_PER_DEVICE = Number(process.env.MAX_PHONE_PER_DEVICE || 4);
 const MAX_FRAME_BYTES = 1024 * 1024;
@@ -135,7 +158,34 @@ const MAX_PHONE_BUFFER_BYTES = 8 * 1024 * 1024;
 /** WebSocket 发送缓冲上限（连接器/手机任一侧超限即拒发，避免静默丢帧）。 */
 const MAX_SOCKET_BUFFER_BYTES = 8 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 110_000; // 高于 Cloudflare 524 阈值（100s），保证我们能先给出明确错误而非 CF 超时页
-const CONNECT_RATE = { windowMs: 60_000, max: 60 };
+const RESPONSE_IDLE_TIMEOUT_MS = Number(process.env.RELAY_RESPONSE_IDLE_TIMEOUT_MS) >= 1000
+  ? Number(process.env.RELAY_RESPONSE_IDLE_TIMEOUT_MS) : 120_000;
+/**
+ * 入口限流阈值（每 IP / 每分钟）。
+ *
+ * ★ 2026-10-02 审查：rateLimit() 此前是**零调用点**的死代码 —— README 承诺的
+ *   「单 IP 60/min」从未生效，公网端口对任何脚本都是无限预算；连接上限同理只在
+ *   onPhoneSocket 里按设备计，不按来源计。
+ * ★ 三桶必须彼此独立：PWA 首屏会一次并发 50~60 个模块请求，若与 /connector 或
+ *   配对端点共用 60/min，正常用户第一次刷新就会被 429 打死。
+ * ★ 部署形态是 Caddy 回环反代：所有手机在 req.socket 上都是 127.0.0.1，
+ *   因此桶 key 必须经 XFF 还原真实客户端（见 clientBucketKey）。
+ */
+const RATE_WINDOW_MS = 60_000;
+function rateLimitMax(envName, fallback) {
+  const value = Number(process.env[envName]);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+const RATE_LIMITS = {
+  // /connector 升级：严格桶（README 承诺的「单 IP 60/min」）。
+  connector: { windowMs: RATE_WINDOW_MS, max: rateLimitMax('RELAY_RATE_CONNECTOR_PER_MIN', 60) },
+  // 配对端点（/kite/pair、/kite/pair/*）：配对令牌一次性，高频必是滥用。
+  pair: { windowMs: RATE_WINDOW_MS, max: rateLimitMax('RELAY_RATE_PAIR_PER_MIN', 60) },
+  // 其余手机 HTTP/WS：首屏并发模块请求 + 轮询，阈值必须显著更宽。
+  phone: { windowMs: RATE_WINDOW_MS, max: rateLimitMax('RELAY_RATE_PHONE_PER_MIN', 600) }
+};
+/** 跟踪表硬顶：XFF 是不可信输入，没有硬顶就能被伪造值撑成无界 Map（内存放大）。 */
+const RATE_MAX_TRACKED_KEYS = 20_000;
 
 const metrics = {
   connectorConnects: 0, phoneConnects: 0, httpRequests: 0, wsBridges: 0, rejected: 0,
@@ -152,7 +202,11 @@ const metrics = {
   dropped: 0,
   droppedByReason: new Map(),
   closesByCode: new Map(),
-  largestFrameBytes: 0
+  largestFrameBytes: 0,
+  // ---- 入口防护观测（2026-10-02 审查）----
+  // rateLimited: 桶名 → { count }；metricsDenied: /metrics 未授权访问次数。
+  rateLimited: new Map(),
+  metricsDenied: 0
 };
 
 /** 记录见过的最大帧。判断「是不是撞上 MAX_FRAME_BYTES」全看它。 */
@@ -217,6 +271,10 @@ const conflictLogged = new Set();
  * 另有两个信令键：`pair:<channel>` 与 `ch:<channel>` → { phone }
  */
 const streams = new Map();
+/** 全局手机 socket 上限；MAX_PHONE_PER_DEVICE 不能防止每次生成新 pair-UUID。 */
+const MAX_PHONE_SOCKETS = Number.isFinite(Number(process.env.MAX_PHONE_SOCKETS)) && Number(process.env.MAX_PHONE_SOCKETS) > 0
+  ? Math.floor(Number(process.env.MAX_PHONE_SOCKETS)) : 256;
+const phoneSockets = new Set();
 /** 每 IP 连接速率 */
 const connectRate = new Map();
 
@@ -271,15 +329,107 @@ setInterval(() => {
   }
 }, PHONE_PING_MS);
 
-function rateLimit(ip) {
+/**
+ * 桶 key 归一化。★ XFF 是不可信输入，必须限长限字符集：没有这一步，一个伪造的
+ * 超长 XFF 就能把 connectRate 撑成无界 Map（限流器自己变成内存放大通道）。
+ * IPv4:port / IPv6-mapped / 方括号 IPv6 归一化；其余超长或含非法字符的值退化为
+ * 短哈希 —— 保证「每个伪造值仍落在独立桶」，不会把正常流量挤进同一个桶。
+ */
+function normalizeBucketKey(raw) {
+  if (typeof raw !== 'string') return null;
+  let key = raw.trim();
+  if (!key) return null;
+  key = key.replace(/^::ffff:/i, '').replace(/^\[|\]$/g, '');
+  const v4 = /^(\d{1,3}(?:\.\d{1,3}){3}):\d+$/.exec(key);
+  if (v4) key = v4[1];
+  if (key.length <= 64 && /^[0-9a-zA-Z.:_-]+$/.test(key)) return key;
+  return 'h:' + createHash('sha256').update(key).digest('hex').slice(0, 16);
+}
+
+function isLoopbackAddr(addr) {
+  if (typeof addr !== 'string' || !addr) return false;
+  const bare = addr.replace(/^::ffff:/i, '');
+  return bare === '::1' || bare === '127.0.0.1' || bare.startsWith('127.');
+}
+
+/**
+ * 限流桶 key：Caddy 是回环反代，所有手机在 socket 层都是 127.0.0.1，
+ * 因此【仅当远端是回环时】才采信 X-Forwarded-For 的第一个非空条目；否则一律用
+ * socket 对端地址（直连部署 / 本机调试时 XFF 可能根本不存在，或纯属伪造）。
+ * ★ 该采信成立的前提是「中继前面只有 Caddy 这一层反代」：Caddy 未配 trusted_proxies
+ *   时会用真实对端覆写 XFF。若日后在 Caddy 前面再加 CDN/负载均衡，必须重新审视此处
+ *   （否则第一个条目可由客户端自带，轮换即可绕过按 IP 的分桶）。
+ */
+function clientBucketKey(req) {
+  const remote = req.socket?.remoteAddress ?? '';
+  if (isLoopbackAddr(remote)) {
+    const raw = req.headers['x-forwarded-for'];
+    const value = Array.isArray(raw) ? raw[0] : raw;
+    if (typeof value === 'string') {
+      const first = value.split(',')[0] ?? '';
+      const key = normalizeBucketKey(first);
+      if (key) return key;
+    }
+  }
+  return normalizeBucketKey(remote) ?? 'unknown';
+}
+
+/** 路径 → 限流桶：/connector 与配对端点走严格桶，其余手机流量走宽桶。 */
+function rateBucketFor(pathname) {
+  if (pathname === '/connector') return 'connector';
+  if (pathname === '/kite/pair' || pathname.startsWith('/kite/pair/')) return 'pair';
+  return 'phone';
+}
+
+function sweepRateMap(now = Date.now()) {
+  for (const [key, entry] of connectRate) {
+    if (now - entry.start > RATE_WINDOW_MS * 2) connectRate.delete(key);
+  }
+}
+
+// ★ 定时清理 connectRate：旧 rateLimit 是死代码，所以这个 Map 的泄漏从未暴露过。
+//   unref() 让它不阻止进程退出（测试里 relay 子进程退出得快）。
+const rateSweepTimer = setInterval(() => sweepRateMap(), RATE_WINDOW_MS * 2);
+rateSweepTimer.unref();
+
+/**
+ * 入口限流（HTTP 与 WS 升级共用）。
+ * @returns {null | { retryAfterSec: number }} null = 放行；非 null = 超限（附 Retry-After 秒数）。
+ */
+function rateLimit(bucket, key) {
+  const { windowMs, max } = RATE_LIMITS[bucket];
   const now = Date.now();
-  let entry = connectRate.get(ip);
-  if (!entry || now - entry.start > CONNECT_RATE.windowMs) {
+  const mapKey = `${bucket}\u0000${key}`;
+  let entry = connectRate.get(mapKey);
+  if (entry && now - entry.start > windowMs) entry = null; // 窗口过期 → 复用同一 key 重新计数
+  if (!entry) {
+    if (connectRate.size >= RATE_MAX_TRACKED_KEYS) {
+      sweepRateMap(now);
+      // 清完仍满 → fail-closed：宁可在极端攻击下拒新 key，也不让跟踪表无界增长。
+      if (connectRate.size >= RATE_MAX_TRACKED_KEYS) {
+        return { retryAfterSec: Math.ceil(windowMs / 1000) };
+      }
+    }
     entry = { start: now, count: 0 };
-    connectRate.set(ip, entry);
+    connectRate.set(mapKey, entry);
   }
   entry.count += 1;
-  return entry.count <= CONNECT_RATE.max;
+  if (entry.count <= max) return null;
+  return { retryAfterSec: Math.max(1, Math.ceil((entry.start + windowMs - now) / 1000)) };
+}
+
+/**
+ * 记一次限流拒绝：计数进 metrics.rejected（/healthz 与 /metrics 可观测），日志按
+ * 每桶前 5 次 + 之后每 100 次限流 —— 否则攻击本身就是日志放大器。
+ */
+function noteRateLimited(bucket, kind, key, pathname) {
+  metrics.rejected += 1;
+  const entry = metrics.rateLimited.get(bucket) ?? { count: 0 };
+  entry.count += 1;
+  metrics.rateLimited.set(bucket, entry);
+  if (entry.count <= 5 || entry.count % 100 === 0) {
+    console.log(`[ra-relay] 限流拒绝 bucket=${bucket} kind=${kind} key=${key.slice(0, 24)} path=${pathname} 累计=${entry.count}`);
+  }
 }
 
 /**
@@ -361,6 +511,11 @@ function routeHintFromCookie(header) {
  *   在 cookie 未命中后直接掉进「多连接器投第一个」的抽奖，把请求送进错误/僵尸
  *   连接器，手机卡死在「配对完成，正在进入 DSH…」。
  */
+function liveConnector(id) {
+  const ws = connectors.get(id);
+  return ws?.readyState === 1 ? ws : null;
+}
+
 function connectorFor(req, url) {
   const cookieHint = routeHintFromCookie(req.headers.cookie);
   const cParam = url.searchParams.get('c');
@@ -368,10 +523,11 @@ function connectorFor(req, url) {
     if (!hint) continue;
     const entry = devices.get(hint);
     if (entry) {
-      const ws = connectors.get(entry.connectorId);
+      const ws = liveConnector(entry.connectorId);
       if (ws) return { ws, deviceId: hint };
     }
-    if (connectors.has(hint)) return { ws: connectors.get(hint), deviceId: 'pair' };
+    const ws = liveConnector(hint);
+    if (ws) return { ws, deviceId: 'pair' };
     // hint 存在但查不到映射 → 尝试下一个候选（设备表可能刚更新、cookie 可能陈旧）。
     // ★ 真机事故 2026-09-30：旧实现只认「hint 完全为空」才兜底，导致带陈旧 cookie
     //   的真实请求被拒（界面卡在「重新连接中…」、每次请求都要等超时）。
@@ -381,6 +537,7 @@ function connectorFor(req, url) {
   //   中继不做信任判断 —— 真正的准入仍由连接器验签（ticket）裁决，中继只是转发。
   if (connectors.size === 1) {
     const first = connectors.entries().next().value;
+    if (first?.[1]?.readyState !== 1) return null;
     return { ws: first[1], deviceId: cookieHint ?? cParam ?? 'pair' };
   }
 
@@ -388,8 +545,9 @@ function connectorFor(req, url) {
   if (connectors.size > 1
       && (url.pathname === '/kite/pair' || url.pathname.startsWith('/kite/pair/')
           || url.pathname === '/kite/welcome')) {
-    const first = connectors.entries().next().value;
-    console.log(`[ra-relay] 多连接器兜底：${url.pathname} 无确定路由键（cookie=${cookieHint ?? '无'} c=${cParam ?? '无'}），投给第一个连接器`);
+    const first = [...connectors.entries()].find(([, ws]) => ws.readyState === 1);
+    if (!first) return null;
+    console.log(`[ra-relay] 多连接器兜底：${url.pathname} 无确定路由键（cookie=${(cookieHint ?? '无').slice(0, 12)} c=${(cParam ?? '无').slice(0, 12)}），投给第一个连接器`);
     return { ws: first[1], deviceId: 'pair' };
   }
   return null;
@@ -402,6 +560,8 @@ function handleHealth(res) {
   // 这两个数就是「有没有丢帧、最大帧离 1 MiB 上限还有多远」的现场快照。
   const droppedByReason = {};
   for (const [reason, entry] of metrics.droppedByReason) droppedByReason[reason] = entry.count;
+  const rateLimitedByBucket = {};
+  for (const [bucket, entry] of metrics.rateLimited) rateLimitedByBucket[bucket] = entry.count;
   res.writeHead(200, { 'content-type': 'application/json' });
   res.end(JSON.stringify({
     ok: true,
@@ -411,7 +571,10 @@ function handleHealth(res) {
     dropped: metrics.dropped,
     droppedByReason,
     largestFrameBytes: metrics.largestFrameBytes,
-    frameLimitBytes: MAX_FRAME_BYTES
+    frameLimitBytes: MAX_FRAME_BYTES,
+    // 入口防护计数：限流拒绝按桶计数 + /metrics 未授权访问次数（都是数字，无敏感值）。
+    rateLimitedByBucket,
+    metricsDenied: metrics.metricsDenied
   }));
 }
 
@@ -434,8 +597,15 @@ function handleMetrics(res) {
     // 带 label 的两个家族：TYPE 行必须**只出现一次**，不能跟着样本一起循环发
     // （重复 TYPE 行不是合法 Prometheus 文本；初版就是循环里发的，已由测试反证）。
     '# TYPE ra_relay_dropped_by_reason_total counter',
-    '# TYPE ra_relay_ws_close_total counter'
+    '# TYPE ra_relay_ws_close_total counter',
+    // ---- 入口防护（2026-10-02 审查）----
+    '# TYPE ra_relay_metrics_denied_total counter',
+    `ra_relay_metrics_denied_total ${metrics.metricsDenied}`,
+    '# TYPE ra_relay_rate_limited_total counter'
   ];
+  for (const [bucket, entry] of [...metrics.rateLimited].sort((a, b) => b[1].count - a[1].count)) {
+    lines.push(`ra_relay_rate_limited_total{bucket="${bucket}"} ${entry.count}`);
+  }
   for (const [reason, entry] of [...metrics.droppedByReason].sort((a, b) => b[1].count - a[1].count)) {
     lines.push(`ra_relay_dropped_by_reason_total{reason="${reason}"} ${entry.count}`);
   }
@@ -446,6 +616,37 @@ function handleMetrics(res) {
   lines.push('');
   res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4' });
   res.end(lines.join('\n'));
+}
+
+/**
+ * 令牌常数时间比对。★ 不提前 return：否则「命中的是集合里第几个/前缀多长」会从
+ * 耗时上泄漏。空令牌集恒 false（开放模式不豁免鉴权点，见 metricsAuthorized）。
+ */
+function tokenMatches(candidate) {
+  if (typeof candidate !== 'string' || candidate.length === 0 || RELAY_TOKENS.size === 0) return false;
+  const cand = Buffer.from(candidate, 'utf8');
+  let ok = false;
+  for (const token of RELAY_TOKENS) {
+    const known = Buffer.from(token, 'utf8');
+    if (known.length === cand.length && timingSafeEqual(known, cand)) ok = true;
+  }
+  return ok;
+}
+
+/**
+ * /metrics 鉴权（2026-10-02 审查）。
+ * ★ 不能拿「回环」当判据：部署形态是 Caddy 回环反代，**恶意公网请求的 remoteAddress
+ *   同样是 127.0.0.1** —— 按回环放行等于公网裸奔（旧实现更糟：无条件返回 Prometheus
+ *   文本，连接器数、设备数、丢帧细节对全网可见）。
+ *   唯一可用的判据是「携带有效 RELAY_TOKENS 令牌」：Authorization: Bearer <token>
+ *   或 ?token=<token>。不通过一律 404（不暴露端点存在性）。
+ */
+function metricsAuthorized(req, _url) {
+  const header = req.headers.authorization;
+  const candidate = typeof header === 'string' && /^Bearer\s+/i.test(header)
+    ? header.replace(/^Bearer\s+/i, '').trim()
+    : null;
+  return tokenMatches(candidate);
 }
 
 
@@ -469,10 +670,39 @@ function renderRelayHint({ hasConnector, path }) {
 }
 
 function handlePhoneHttp(req, res) {
-  console.error(`[ra-relay][dbg] +${Date.now() % 100000} req ${req.method} ${req.url}`);
   const url = new URL(req.url ?? '/', 'http://x');
+  // ★ 只打印 pathname（2026-10-02 审查）：查询串里可能带一次性配对令牌（?token=）
+  //   与设备凭据，整条 req.url 落进 journald 等于把凭据写进日志。
+  console.error(`[ra-relay][dbg] +${Date.now() % 100000} req ${req.method} ${url.pathname}`);
+  // ★ 限流必须在路由/转发之前：超限请求不得消耗连接器与内存资源。
+  //   /healthz 刻意豁免 —— 它是 systemd/Caddy/install.sh 判活的唯一探针，
+  //   攻击期间把它 429 掉等于自己制造「服务不健康」的误报。
+  if (url.pathname !== '/healthz') {
+    const bucket = rateBucketFor(url.pathname);
+    const key = clientBucketKey(req);
+    const limited = rateLimit(bucket, key);
+    if (limited) {
+      noteRateLimited(bucket, 'http', key, url.pathname);
+      res.writeHead(429, {
+        'content-type': 'text/plain; charset=utf-8',
+        'retry-after': String(limited.retryAfterSec),
+        'cache-control': 'no-store, no-cache, must-revalidate, max-age=0'
+      });
+      res.end('rate limited\n');
+      return;
+    }
+  }
   if (url.pathname === '/healthz') return handleHealth(res);
-  if (url.pathname === '/metrics') return handleMetrics(res);
+  if (url.pathname === '/metrics') {
+    if (!metricsAuthorized(req, url)) {
+      metrics.metricsDenied += 1;
+      metrics.rejected += 1;
+      res.writeHead(404, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store' });
+      res.end('not found\n');
+      return;
+    }
+    return handleMetrics(res);
+  }
   // ★ 只对 HTML/API 禁止缓存（配对页、状态接口必须新鲜）；静态资源放行浏览器缓存。
   //   真机事故 2026-10-01：全局 no-store 导致 57 个客户端模块（~10MB）每次刷新全量重下，
   //   经隧道要 100+ 秒 → 表现为「同步很慢」。资源 URL 带 ?rev= 指纹，可安全长缓存。
@@ -483,12 +713,12 @@ function handlePhoneHttp(req, res) {
   }
   metrics.httpRequests += 1;
   const routed = connectorFor(req, url);
-  console.error(`[ra-relay][dbg] +${Date.now() % 100000} routed ${req.url} → cid=${routed?.ws ? connectorIdOf(routed.ws) : 'NULL'}`);
+  console.error(`[ra-relay][dbg] +${Date.now() % 100000} routed ${url.pathname} → cid=${routed?.ws ? connectorIdOf(routed.ws) : 'NULL'}`);
   if (!routed?.ws) {
     // 诊断：未路由请求记录关键事实（不含敏感值），便于定位是 c 缺失/错配还是连接器离线。
     const rawCookie = typeof req.headers.cookie === 'string' ? req.headers.cookie : '';
     const hasDeviceCookie = /(^|;\s*)ra-device=/.test(rawCookie);
-    console.log(`[ra-relay] 未路由 ${req.method} ${url.pathname} c=${url.searchParams.get('c') ?? '(无)'} cookieHint=${routeHintFromCookie(req.headers.cookie) ?? '(无)'} hasRaDevice=${hasDeviceCookie} cookieNames=[${rawCookie.split(';').map((s) => s.split('=')[0].trim()).filter(Boolean).join(',')}] connectors=${connectors.size} devices=${devices.size}`);
+    console.log(`[ra-relay] 未路由 ${req.method} ${url.pathname} c=${(url.searchParams.get('c') ?? '(无)').slice(0, 12)} cookieHint=${(routeHintFromCookie(req.headers.cookie) ?? '(无)').slice(0, 12)} hasRaDevice=${hasDeviceCookie} cookieNames=[${rawCookie.split(';').map((s) => s.split('=')[0].trim()).filter(Boolean).join(',')}] connectors=${connectors.size} devices=${devices.size}`);
     // ★ 兜底：带了 ra-device 但解析失败（例如旧格式票据）—— 不能在这里「路由」。
     //   真机事故 2026-10-02：这里原本写的是 `return { ws: first[1], deviceId: 'pair' };`
     //   但本函数返回 void（第 780 行 handler 直接丢弃返回值），且**没有任何 res 写入** ——
@@ -527,43 +757,88 @@ function handlePhoneHttp(req, res) {
   let size = 0;
   let aborted = false;
   let settled = false;
+  let headersSent = false;
+  let bodyTimer = null;
+  let streamConnectorId = connectorIdOf(connector);
 
-  // ★ 看门狗只覆盖「等连接器回应」阶段；一旦响应头到达就清除（流式/长请求可能远超此值）。
-  //   旧实现的 30s 会在长请求上误杀，表现为 Cloudflare 524 / context canceled / EOF
-  //   （真机事故 2026-09-30：DSH 的 /api/session/list 等接口响应较慢）。
-  const timer = setTimeout(() => {
+  const clearStreamTimers = () => {
+    clearTimeout(timer);
+    clearTimeout(bodyTimer);
+    bodyTimer = null;
+  };
+  const finishHttp = (status, message) => {
     if (settled) return;
     settled = true;
+    clearStreamTimers();
     streams.delete(streamId);
-    res.writeHead(504, { 'content-type': 'text/plain' });
-    res.end('connector timeout');
-  }, REQUEST_TIMEOUT_MS);
+    if (res.destroyed || res.writableEnded) return;
+    if (headersSent) {
+      res.destroy();
+      return;
+    }
+    res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8' });
+    res.end(message);
+  };
+  const cancelConnectorStream = (reason) => {
+    if (connector?.readyState === 1) send(connector, { kind: 'http-cancel', deviceId: routeDeviceId, streamId, reason });
+  };
+  // 看门狗覆盖等待连接器响应和响应体空闲阶段；收到响应头后切换到 idle deadline。
+  const timer = setTimeout(() => finishHttp(504, 'connector timeout'), REQUEST_TIMEOUT_MS);
+  const resetBodyTimer = () => {
+    clearTimeout(bodyTimer);
+    bodyTimer = setTimeout(() => {
+      cancelConnectorStream('response idle timeout');
+      finishHttp(504, 'response idle timeout');
+    }, RESPONSE_IDLE_TIMEOUT_MS);
+    bodyTimer.unref?.();
+  };
 
   res.on('close', () => {
-    // close 在响应正常结束后也会触发；这里只清理**尚未拿到响应头**的挂起流，
-    // 避免把仍在途的连接器响应误判为取消。
-    clearTimeout(timer);
-    if (!settled) streams.delete(streamId);
-    else streams.delete(streamId);
+    if (res.writableEnded) return;
+    aborted = true;
+    cancelConnectorStream('client disconnected');
+    clearStreamTimers();
+    streams.delete(streamId);
   });
-  req.on('error', () => streams.delete(streamId));
+  req.on('aborted', () => {
+    aborted = true;
+    cancelConnectorStream('request aborted');
+    clearStreamTimers();
+    streams.delete(streamId);
+  });
+  req.on('error', () => {
+    aborted = true;
+    cancelConnectorStream('request error');
+    clearStreamTimers();
+    streams.delete(streamId);
+  });
   req.on('data', (chunk) => {
-    if (aborted) return;
+    if (aborted || settled) return;
     size += chunk.length;
     if (size > MAX_BODY_BYTES) {
       aborted = true;
-      clearTimeout(timer);
-      streams.delete(streamId);
-      res.writeHead(413, { 'content-type': 'text/plain' });
-      res.end('body too large for relay');
+      cancelConnectorStream('body too large');
+      finishHttp(413, 'body too large for relay');
       return;
     }
     chunks.push(chunk);
   });
   req.on('end', () => {
-    if (aborted) return;
+    if (aborted || settled) return;
     const body = Buffer.concat(chunks);
-    streams.set(streamId, { res, connectorId: routeDeviceId, resourceUrl: req.url ?? '/' });
+    streams.set(streamId, {
+      res,
+      connectorId: streamConnectorId,
+      deviceId: routeDeviceId,
+      resourceUrl: req.url ?? '/',
+      timer,
+      get bodyTimer() { return bodyTimer; },
+      get headersSent() { return headersSent; },
+      set headersSent(value) { headersSent = value; },
+      onHeaders: () => { headersSent = true; clearTimeout(timer); resetBodyTimer(); },
+      onBody: () => resetBodyTimer(),
+      onDone: () => { settled = true; clearStreamTimers(); streams.delete(streamId); }
+    });
     const head = {
       kind: 'http-head',
       deviceId: routeDeviceId,
@@ -573,30 +848,25 @@ function handlePhoneHttp(req, res) {
       headers: {
         cookie: typeof req.headers.cookie === 'string' ? req.headers.cookie : '',
         'content-type': typeof req.headers['content-type'] === 'string' ? req.headers['content-type'] : '',
-        // ★ 客户端是否接受 gzip —— 连接器据此决定是否压缩响应（DSH 桌面壳覆盖了
-        //   webserver 的 compression 配置，上游不压缩，由连接器补做以降低隧道传输量）。
-        //   这是中继→连接器的内部头，不经代理白名单，不影响「转发给 DSH 的头集合」契约。
         'accept-encoding': typeof req.headers['accept-encoding'] === 'string' ? req.headers['accept-encoding'] : ''
       }
     };
     const headSent = send(connector, head);
-    console.error(`[ra-relay][dbg] +${Date.now() % 100000} head sent ${req.url} → ok=${headSent}`);
     if (!headSent) {
-      clearTimeout(timer);
-      streams.delete(streamId);
-      if (!settled) {
-        settled = true;
-        res.writeHead(502, { 'content-type': 'text/plain' });
-        res.end('connector offline');
-      }
+      cancelConnectorStream('connector offline');
+      finishHttp(502, 'connector offline');
       return;
     }
-    // 分片发送（≤256KiB 原始字节，避免超 1 MiB 帧上限被静默丢弃）；空 body 也发 final 帧。
     const CHUNK = 256 * 1024;
     for (let offset = 0; offset < body.length || offset === 0; offset += CHUNK) {
+      if (aborted || settled) return;
       const piece = body.subarray(offset, offset + CHUNK);
       const final = offset + CHUNK >= body.length;
-      if (!send(connector, { kind: 'http-body', deviceId: routeDeviceId, streamId, chunk: piece.toString('base64url'), final })) break;
+      if (!send(connector, { kind: 'http-body', deviceId: routeDeviceId, streamId, chunk: piece.toString('base64url'), final })) {
+        cancelConnectorStream('request body send failed');
+        finishHttp(502, 'connector offline');
+        return;
+      }
       if (final) break;
     }
   });
@@ -611,12 +881,22 @@ function handlePhoneHttp(req, res) {
 //   29KB/条 assistant/message）走 base64 JSON 帧全程无压缩，是「同步不跟手」的
 //   主因之一（真机 2026-10-02）；pmd 在中继↔手机这段把 JSON 文本压回 ~15–25%。
 //   threshold：<1KB 的帧不值得压（控制帧/小 RPC 占多数，避免 CPU 空转）。
+// ★ 关上下文接管 + 收窄客户端压窗口（2026-10-02 审查）：pmd 是**解压炸弹**的入口 ——
+//   maxPayload 量的是【压缩后的线上字节】，判定发生在解压之前，因此一个几百字节的
+//   线上帧可以换到远超 MAX_WIRE_FRAME_BYTES 的堆内存；开了上下文接管后同一连接上
+//   后续帧还能引用前面帧建立的字典，膨胀比进一步放大（DEFLATE 单帧最坏已在千倍量级）。
+//   noContextTakeover 让每帧独立压缩（膨胀上界被单帧字典限死）；clientMaxWindowBits=12
+//   把客户端压窗口从默认 15（32 KiB 字典）收到 12（4 KiB 字典），对 JSON 文本的压缩率
+//   影响很小，却把最坏膨胀压下去。副作用仅限压缩率，不改变协议语义。
 const wss = new WebSocketServer({
   noServer: true,
   maxPayload: MAX_WIRE_FRAME_BYTES,
   perMessageDeflate: {
     threshold: 1024,
-    noDelay: true
+    noDelay: true,
+    serverNoContextTakeover: true,
+    clientNoContextTakeover: true,
+    clientMaxWindowBits: 12
   }
 });
 
@@ -629,9 +909,20 @@ function bearerFromProtocols(protocols) {
 
 function handleUpgrade(req, socket, head) {
   const url = new URL(req.url ?? '/', 'http://x');
+  // ★ 升级入口同样必须限流（2026-10-02 审查）：旧实现只把 rateLimit 定义在那儿、
+  //   零调用点，WS 升级路径完全裸奔 —— 而一次 /connector 升级就是一条长连接，
+  //   成本远高于单次 HTTP。桶跟着路径走：/connector 与配对端点严格，其余手机升级用宽桶。
+  const bucket = rateBucketFor(url.pathname);
+  const key = clientBucketKey(req);
+  const limited = rateLimit(bucket, key);
+  if (limited) {
+    noteRateLimited(bucket, 'upgrade', key, url.pathname);
+    socket.end(`HTTP/1.1 429 Too Many Requests\r\nRetry-After: ${limited.retryAfterSec}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`);
+    return;
+  }
   if (url.pathname === '/connector') {
     const token = bearerFromProtocols(req.headers['sec-websocket-protocol']?.split(/,\s*/)) ?? url.searchParams.get('token');
-    if (RELAY_TOKENS.size > 0 && (!token || !RELAY_TOKENS.has(token))) {
+    if (RELAY_TOKENS.size > 0 && !tokenMatches(token)) {
       metrics.rejected += 1;
       socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
       return;
@@ -702,8 +993,11 @@ function onConnector(ws, url) {
 
   ws.on('close', (code, reason) => {
     recordClose('connector', code, reason);
-    if (connectors.get(connectorId) === ws) connectors.delete(connectorId);
-    publishedDevices.delete(connectorId); // 该连接器的权威设备表随之下线（条目已在下面清掉）
+    const isCurrent = connectors.get(connectorId) === ws;
+    if (!isCurrent) return;
+    connectors.delete(connectorId);
+    // Pair-Proof owner 是持久密码学事实，不能因 socket 短暂断开而清除。
+    publishedDevices.delete(connectorId);
     for (const [deviceId, entry] of [...devices]) {
       if (entry.connectorId === connectorId) {
         for (const phone of entry.phones) {
@@ -713,14 +1007,15 @@ function onConnector(ws, url) {
       }
     }
     for (const [streamId, stream] of [...streams]) {
-      if (stream.connectorId !== connectorId && stream.res === undefined && stream.phone === undefined) continue;
-      // 只清理属于该 connector 的挂起项：http 流用 res，PWA 桥用 phone。
-      const isThisConnector = (stream.connectorId === connectorId) || (stream.res !== undefined);
-      if (!isThisConnector) continue;
+      if (stream.connectorId !== connectorId) continue;
       clearTimeout(stream.timer);
-      if (stream.res && !stream.res.destroyed) {
-        stream.res.writeHead(502, { 'content-type': 'text/plain' });
-        stream.res.end('connector disconnected');
+      stream.bodyTimer && clearTimeout(stream.bodyTimer);
+      if (stream.res && !stream.res.destroyed && !stream.res.writableEnded) {
+        if (stream.headersSent) stream.res.destroy();
+        else {
+          stream.res.writeHead(502, { 'content-type': 'text/plain' });
+          stream.res.end('connector disconnected');
+        }
       }
       if (stream.phone && stream.phone.readyState === 1) stream.phone.close(1001, 'connector offline');
       streams.delete(streamId);
@@ -739,12 +1034,12 @@ function relayConnectorFrame(connectorWs, frame) {
   const kind = frame.kind;
   if (kind === 'http-res-head' || kind === 'http-res-body' || kind === 'http-error') {
     const stream = streams.get(frame.streamId);
-    if (!stream?.res || stream.res.destroyed) {
+    if (!stream?.res || stream.connectorId !== connectorIdOf(connectorWs) || stream.res.destroyed) {
       streams.delete(frame.streamId);
       return;
     }
     if (kind === 'http-res-head') {
-      clearTimeout(stream.timer);
+      stream.onHeaders?.();
       const headers = { ...(frame.headers ?? {}) };
       if (!headers['content-type']) headers['content-type'] = 'application/octet-stream';
       // ★ 带指纹的资源（?rev=xxx / /assets/xxx-hash.js）允许浏览器强缓存：
@@ -756,6 +1051,7 @@ function relayConnectorFrame(connectorWs, frame) {
         headers['cache-control'] = 'public, max-age=31536000, immutable';
       }
       stream.pendingHeaders = headers;
+      stream.headersSent = true;
       stream.res.writeHead(frame.status ?? 502, headers);
       return;
     }
@@ -764,23 +1060,45 @@ function relayConnectorFrame(connectorWs, frame) {
       metrics.bytesRelayed += chunk.length;
       if (frame.final) {
         stream.res.end(chunk);
-        streams.delete(frame.streamId);
+        stream.onDone?.();
       } else {
-        stream.res.write(chunk);
+        stream.onBody?.();
+        if (stream.res.write(chunk) === false) {
+          stream.res.destroy();
+          streams.delete(frame.streamId);
+        }
       }
       return;
     }
     // 业务错误按插件给的 status 回（4xx），仅真正未知回 502 —— 避免被 Cloudflare 用
     // 自有 HTML 覆盖而让前端 JSON 解析崩溃。
     const status = Number.isInteger(frame.status) && frame.status >= 400 && frame.status < 500 ? frame.status : 502;
-    stream.res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
-    stream.res.end(JSON.stringify({ error: frame.code ?? 'relay/error', message: frame.message ?? '' }));
-    streams.delete(frame.streamId);
+    if (stream.headersSent) stream.res.destroy();
+    else {
+      stream.res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
+      stream.res.end(JSON.stringify({ error: frame.code ?? 'relay/error', message: frame.message ?? '' }));
+    }
+    stream.onDone?.();
+    return;
+  }
+  if (kind === 'ws-accept') {
+    const stream = streams.get(frame.streamId);
+    if (stream?.acceptTimer) {
+      clearTimeout(stream.acceptTimer);
+      stream.acceptTimer = null;
+    }
+    if (stream?.phone?.readyState === 1) return;
     return;
   }
   if (kind === 'ws-data' || kind === 'ws-close') {
     const stream = streams.get(frame.streamId);
-    if (!stream?.phone) return;
+    if (!stream?.phone || stream.connectorId !== connectorIdOf(connectorWs)) return;
+    if (kind === 'ws-close') {
+      if (stream.acceptTimer) clearTimeout(stream.acceptTimer);
+      if (stream.phone.readyState === 1) stream.phone.close(frame.code ?? 1000, 'connector closed');
+      streams.delete(frame.streamId);
+      return;
+    }
     if (kind === 'ws-data') {
       const payload = Buffer.from(frame.data ?? '', 'base64url');
       noteFrame(payload.length);
@@ -793,10 +1111,11 @@ function relayConnectorFrame(connectorWs, frame) {
       //   超过上限即关闭该桥（让客户端重连并靠 session 游标追平，而不是无限积压）。
       //   ⚠ 但这正是 revision 跳号的触发场景之一：断桥 → 客户端重连 → resume。
       //     P0 先让它可数可见；是否改语义（换关闭码 / 让客户端重取 snapshot）等数据说话。
-      if (stream.phone.bufferedAmount > MAX_PHONE_BUFFER_BYTES) {
+      const bufferedAmount = Number(stream.phone.bufferedAmount ?? 0);
+      if (bufferedAmount + payload.length > MAX_PHONE_BUFFER_BYTES) {
         recordDrop('downlink_backpressure', {
           streamId: frame.streamId,
-          bufferedAmount: stream.phone.bufferedAmount,
+          bufferedAmount,
           limit: MAX_PHONE_BUFFER_BYTES,
           size: payload.length
         });
@@ -807,8 +1126,6 @@ function relayConnectorFrame(connectorWs, frame) {
       stream.phone.send(payload, { binary: frame.opcode !== 1, fin: frame.fin !== false });
       return;
     }
-    if (stream.phone.readyState === 1) stream.phone.close(frame.code ?? 1000, 'connector closed');
-    streams.delete(frame.streamId);
     return;
   }
   if (kind === 'pair-result' || kind === 'pair-challenge' || kind === 'auth-challenge' || kind === 'auth-result') {
@@ -871,14 +1188,25 @@ function relayConnectorFrame(connectorWs, frame) {
     const connectorId = connectorIdOf(connectorWs);
     if (connectorId) {
       // ★ 先登记「权威设备表」：条目该不该留以它为准（见 publishedDevices）。
-      publishedDevices.set(connectorId, new Set(ids.filter((id) => typeof id === 'string' && id.length > 0)));
+      const declared = new Set(ids.filter((id) => typeof id === 'string' && id.length > 0));
       // 清理该连接器下已不再上报的设备
       for (const [deviceId, entry] of [...devices]) {
-        if (entry.connectorId === connectorId && !ids.includes(deviceId) && entry.phones.size === 0) {
+        if (entry.connectorId === connectorId && !declared.has(deviceId) && entry.phones.size === 0) {
           devices.delete(deviceId);
         }
       }
+      // ★ MAX_DEVICES 真正生效（2026-10-02 审查：该常量此前只被声明、从未被读过）。
+      //   口径：只拒绝【新增】超限 —— 已经登记过的设备维持原状（不把历史部署里已有的
+      //   设备一次性踢下线），本帧里第 MAX_DEVICES+1 个「新面孔」起拒绝登记，并显式
+      //   记日志/计数（绝不静默），同时不写进 publishedDevices（超限设备不获得
+      //   「已发布」语义，避免它反过来成为他人路由改写的判据）。
+      let accepted = 0;
+      for (const [deviceId, entry] of devices) {
+        if (entry.connectorId === connectorId && declared.has(deviceId)) accepted += 1;
+      }
       let rejected = 0;
+      let overCap = 0;
+      const acceptedIds = new Set();
       for (const deviceId of ids) {
         if (typeof deviceId !== 'string' || deviceId.length === 0) continue;
         // ★ 有密码学归属的设备：只认 owner 连接器的上报；他人的上报直接忽略
@@ -892,6 +1220,17 @@ function relayConnectorFrame(connectorWs, frame) {
           continue;
         }
         const existing = devices.get(deviceId);
+        const isNewHere = !existing || existing.connectorId !== connectorId;
+        if (isNewHere && accepted >= MAX_DEVICES) {
+          overCap++;
+          const capKey = `cap:${deviceId}:${connectorId}`;
+          if (!conflictLogged.has(capKey)) {
+            console.log(`[ra-relay] 设备数达上限 MAX_DEVICES=${MAX_DEVICES}，拒绝登记新增设备: deviceId=${deviceId.slice(0, 12)} connector=${connectorId.slice(0, 8)}（该设备拿不到路由；撤销旧设备或调大 MAX_DEVICES）`);
+            conflictLogged.add(capKey);
+          }
+          continue;
+        }
+        acceptedIds.add(deviceId);
         if (existing) {
           // 无 claim 的设备维持【最后上报者赢】+ 冲突日志可观测
           if (existing.connectorId !== connectorId && !conflictLogged.has(deviceId + ':' + connectorId)) {
@@ -902,21 +1241,45 @@ function relayConnectorFrame(connectorWs, frame) {
         } else {
           devices.set(deviceId, { connectorId, phones: new Set() });
         }
+        // ★ 「从别的连接器改归过来」也算本连接器的新增，必须进计数，否则上限可被
+        //   反复换归属绕过。
+        if (isNewHere) accepted += 1;
       }
-      console.log(`[ra-relay] 设备路由表更新：connector=${connectorId.slice(0, 8)} devices=${ids.length}${rejected ? `（拒绝他人 owned ${rejected} 条）` : ''}`);
+      publishedDevices.set(connectorId, acceptedIds);
+      console.log(`[ra-relay] 设备路由表更新：connector=${connectorId.slice(0, 8)} devices=${acceptedIds.size}${rejected ? `（拒绝他人 owned ${rejected} 条）` : ''}${overCap ? `（超上限 MAX_DEVICES=${MAX_DEVICES} 拒绝 ${overCap} 条）` : ''}`);
     }
     return;
   }
   if (kind === 'kick') {
-    const entry = devices.get(frame.deviceId);
+    // ★ 归属校验（2026-10-02 审查）：旧实现只凭设备表条目就执行踢除 —— 任何持有效
+    //   接入令牌的连接器都能踢掉别人的设备（多租户中继上的横向干扰）。判定依据优先用
+    //   中继侧已持久化的 Pair-Proof owner 表（密码学事实），无 claim 的设备退回
+    //   「路由表里的 connectorId」（最后上报者）；两边都没有 = 设备已撤销/从未登记，
+    //   此时幂等无害（什么都不存在，delete 是空操作）。
+    const kicker = connectorIdOf(connectorWs);
+    const targetId = typeof frame.deviceId === 'string' ? frame.deviceId : '';
+    if (!kicker || !targetId) return;
+    const ownerConnectorId = deviceOwners.get(targetId)?.connectorId
+      ?? devices.get(targetId)?.connectorId
+      ?? null;
+    if (ownerConnectorId && ownerConnectorId !== kicker) {
+      metrics.rejected += 1;
+      recordDrop('kick_owner_mismatch', {
+        deviceId: targetId.slice(0, 12),
+        owner: ownerConnectorId.slice(0, 8),
+        from: kicker.slice(0, 8)
+      });
+      return; // 不生效：不关手机 socket、不删条目、不清归属
+    }
+    const entry = devices.get(targetId);
     if (entry) {
       for (const phone of entry.phones) {
         if (phone.readyState === 1) phone.close(4403, 'device revoked');
       }
-      devices.delete(frame.deviceId);
+      devices.delete(targetId);
     }
     // ★ Pair-Proof：kick 同时清除归属（撤销 = owner 事实消除；重配对产生新 claim）。
-    deviceOwners.delete(frame.deviceId);
+    deviceOwners.delete(targetId);
     persistOwners();
     return;
   }
@@ -928,10 +1291,17 @@ function relayConnectorFrame(connectorWs, frame) {
   // ping / pong / 未知帧：中继不裁定协议，静默计数。
 }
 
+const PHONE_WS_ACCEPT_TIMEOUT_MS = Number(process.env.RELAY_PHONE_WS_ACCEPT_TIMEOUT_MS) >= 1000
+  ? Number(process.env.RELAY_PHONE_WS_ACCEPT_TIMEOUT_MS) : 15_000;
+
 function onPhoneSocket(ws, url, req) {
   metrics.phoneConnects += 1;
+  if (phoneSockets.size >= MAX_PHONE_SOCKETS) {
+    ws.close(4429, 'relay phone socket limit');
+    return;
+  }
   const cParam = url.searchParams.get('c');
-  const routed = connectorFor(req, url) ?? (cParam && connectors.has(cParam) ? { ws: connectors.get(cParam), deviceId: 'pair' } : null);
+  const routed = connectorFor(req, url) ?? (cParam && liveConnector(cParam) ? { ws: liveConnector(cParam), deviceId: 'pair' } : null);
   if (!routed?.ws) {
     ws.close(4503, 'connector offline');
     return;
@@ -944,6 +1314,8 @@ function onPhoneSocket(ws, url, req) {
   //   后果是自我破坏的：手机一连实时通道，自己就被挤出路由表，随后所有不带 c 的
   //   请求（首页 + 全部 assets）全 401 → 界面能开但**数据不再实时同步**；
   //   且下次刷新又白屏。因果已实测：WS 前 HTTP 200 ✓ → 建一次 WS → WS 后 HTTP 401 ✗。
+  phoneSockets.add(ws);
+  ws.once('close', () => phoneSockets.delete(ws));
   const connectorId = connectorIdOf(routed.ws) ?? cParam;
   const claimedDeviceId = url.searchParams.get('d') ?? routeHintFromCookie(req.headers.cookie) ?? `pair-${randomUUID().slice(0, 8)}`;
   const channel = url.searchParams.get('ch');
@@ -956,6 +1328,12 @@ function onPhoneSocket(ws, url, req) {
   //   连接建立来登记/触碰；别人的设备一律不写表 —— 该 socket 若真持有效票据，
   //   连接器侧验票后由 ws-data/ws-open 正常桥接，不受影响；若没有，本就进不来。
   //   pair-<random> 临时条目（配对信令）与未发布设备维持原语义。
+  const cryptographicOwner = deviceOwners.get(claimedDeviceId)?.connectorId ?? null;
+  if (cryptographicOwner && cryptographicOwner !== connectorId) {
+    recordDrop('route_hijack_blocked', { deviceId: claimedDeviceId.slice(0, 12), owner: cryptographicOwner.slice(0, 8), via: String(connectorId).slice(0, 8) });
+    ws.close(4403, 'device belongs to another connector');
+    return;
+  }
   const publishedOwner = (() => {
     for (const [connId, set] of publishedDevices) {
       if (set.has(claimedDeviceId)) return connId;
@@ -981,6 +1359,8 @@ function onPhoneSocket(ws, url, req) {
     ws.close(4429, 'too many connections');
     return;
   }
+  phoneSockets.add(ws);
+  ws.once('close', () => phoneSockets.delete(ws));
   entry.phones.add(ws);
   phoneAlive.set(ws, true);
   ws.on('pong', () => phoneAlive.set(ws, true));
@@ -995,14 +1375,28 @@ function onPhoneSocket(ws, url, req) {
   if (url.pathname !== '/device') {
     const streamId = randomUUID();
     metrics.wsBridges += 1;
-    streams.set(streamId, { phone: ws });
-    send(connector, {
+    const stream = { phone: ws, connectorId, deviceId: claimedDeviceId, acceptTimer: null };
+    streams.set(streamId, stream);
+    stream.acceptTimer = setTimeout(() => {
+      if (streams.get(streamId) !== stream) return;
+      recordDrop('ws_accept_timeout', { streamId });
+      try { ws.close(1013, 'connector accept timeout'); } catch { /* ignore */ }
+      streams.delete(streamId);
+    }, PHONE_WS_ACCEPT_TIMEOUT_MS);
+    stream.acceptTimer.unref?.();
+    const sentOpen = send(connector, {
       kind: 'ws-open',
       deviceId: claimedDeviceId,
       streamId,
       path: req.url ?? '/',
       headers: { cookie: typeof req.headers.cookie === 'string' ? req.headers.cookie : '' }
     });
+    if (!sentOpen) {
+      clearTimeout(stream.acceptTimer);
+      try { ws.close(1013, 'connector unavailable'); } catch { /* ignore */ }
+      streams.delete(streamId);
+      return;
+    }
     ws.on('error', (error) => {
       recordDrop('ws_error', {
         peer: 'phone',
@@ -1091,5 +1485,10 @@ const HOST = process.env.HOST || undefined;
 server.listen(PORT, HOST, () => {
   const proto = process.env.TLS_KEY ? 'wss/https' : 'ws/http（开发模式，生产必须配 TLS）';
   const bound = server.address()?.port ?? PORT;
-  console.log(`[ra-relay] listening on ${HOST ?? '0.0.0.0'}:${bound} (${proto}); tokens=${RELAY_TOKENS.size ? 'configured' : 'OPEN — 仅限本地开发'}`);
+  const tokenState = RELAY_TOKENS.size ? `configured(${RELAY_TOKENS.size})` : 'OPEN — 仅限本地开发（ALLOW_OPEN=1）';
+  console.log(`[ra-relay] listening on ${HOST ?? '0.0.0.0'}:${bound} (${proto}); tokens=${tokenState}`);
+  // ★ 开放模式必须刺眼：它可以被误配成生产形态，就必须在每次启动时大声说明后果。
+  if (RELAY_TOKENS.size === 0) {
+    console.warn('[ra-relay] 警告：开放模式（未配置 RELAY_TOKENS）—— 任何公网客户端都可直连本中继与全部连接器，仅供本机联调。生产请配置 RELAY_TOKENS 后重启。');
+  }
 });

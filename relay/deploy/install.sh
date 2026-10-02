@@ -154,6 +154,14 @@ else
   chmod 600 "$TOKEN_FILE"
   log "    已生成新令牌"
 fi
+# ★ 令牌为空必须中止安装（2026-10-02 审查）：上面的 `[ -s "$TOKEN_FILE" ]` 只看
+#   文件大小，一个只含空白/换行的旧令牌文件会走到这里留下空 TOKEN，然后写出
+#   `RELAY_TOKENS=` 的 env —— 中继侧 fail-closed 会拒绝启动，白白经历一次
+#   「装完不可用 → 回滚」。这里提前判死，并保留下面的既有 rollback 流程。
+if [ -z "${TOKEN//[[:space:]]/}" ]; then
+  rollback
+  die "中继令牌为空（${TOKEN_FILE} 存在但内容为空白，或 openssl 生成失败）—— 已回滚。删除该文件后重跑可生成新令牌：rm -f ${TOKEN_FILE}"
+fi
 umask 077
 cat > "$ENV_FILE" <<EOF
 # 由 dsh-kite relay/deploy/install.sh 生成

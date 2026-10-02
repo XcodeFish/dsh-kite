@@ -2,7 +2,10 @@
  * 配对（方案 §6.2）：一次性 pairingToken + 挑战 + 6 位校验码。
  *
  * - token：32B 随机，TTL（默认 120s），用后即焚，timingSafeEqual 比较。
- * - 校验码：SHA256(devicePubKey ‖ connectorPubKey) 前 6 位十进制，双方独立计算，
+ * - 校验码：SHA256(devicePubB64 ‖ "|" ‖ connectorPubB64) 的**前 3 字节按大端序**取值
+ *   再 `% 1000000`，左补零到 6 位十进制；手机侧用 WebCrypto 独立算同一个值
+ *   （算法必须逐字节一致，见 admin/panel.js 配对页与 test/pairing.test.mjs 的跨端断言）。
+ *   注意不是「摘要 hex 的前 6 个字符」—— 两者会得到完全不同的数字。
  *   用户比对一致才确认 —— 用户成为信任根（Signal safety number 轻量版）。
  * - 流程（thin client）：pair-begin(token,pubKey) → pair-challenge →
  *   pair-done(sig(challenge‖connectorId‖ts)) → pair-result(ok, deviceId, setCookie)。
@@ -11,6 +14,7 @@
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { b64d, b64e } from '../transport/frames.js';
 import { newChallenge } from './ticket.js';
+import { deviceIdFromPublicKey } from './device-store.js';
 
 export class PairingError extends Error {
   constructor(code, message) {
@@ -19,7 +23,9 @@ export class PairingError extends Error {
   }
 }
 
-/** 前 6 位十进制校验码（确定性）。 */
+/** 6 位十进制校验码（确定性）：取摘要前 3 字节大端序 % 1000000 再左补零。
+ *  ★ 与手机侧（admin/panel.js 配对页的 crypto.subtle 实现）必须逐字节一致 ——
+ *  两处分叉会让「两端比对」退化为「连接器跟自己对账」。 */
 export function verificationCode(devicePubB64, connectorPubB64) {
   const digest = createHash('sha256').update(`${devicePubB64}|${connectorPubB64}`).digest();
   const n = digest.readUIntBE(0, 3) % 1_000_000;
@@ -73,7 +79,12 @@ export function createPairingService({ keys, tickets, devices, ttlMs, logger, au
 
     /**
      * 设备提交 token + 公钥（thin client pair-begin / PWA 配对页）。
-     * 校验通过 → 登记 pubKey 并签发挑战。返回 {challenge, code}。
+     * 校验通过 → 签发挑战。返回 {challenge, code, deviceId}。
+     *
+     * ★ P2（幽灵设备）：**不在这里写 ACL**。旧实现在提交公钥时就 `devices.upsert()`，
+     *   于是「提交了公钥但从未完成挑战签名」的设备会永久留在设备表里 —— 面板显示一堆
+     *   永远连不上的幽灵条目，用户只能手工撤销。ACL 落库推迟到 complete() 验签通过之后。
+     *   deviceId 是公钥的纯函数（device-store.deviceIdFromPublicKey），不需要预先入库。
      */
     async submit({ token, pubKey, name, channel }) {
       sweep();
@@ -90,14 +101,16 @@ export function createPairingService({ keys, tickets, devices, ttlMs, logger, au
         throw new PairingError('pair/invalid-pubkey', '设备公钥格式非法');
       }
       if (pubRaw.length !== 32) throw new PairingError('pair/invalid-pubkey', '设备公钥必须是 32 字节 Ed25519');
-      const entry = await devices.upsert({ pubKey, name: name || session.name, kind: 'thin' });
+      const deviceId = deviceIdFromPublicKey(pubRaw);
       const challenge = newChallenge();
       const code = verificationCode(pubKey, keys.ed25519.publicB64u);
+      session.pubKey = pubKey;
+      session.deviceName = String(name || session.name).slice(0, 80);
       session.challenge = challenge;
-      session.deviceId = entry.deviceId;
+      session.deviceId = deviceId;
       session.code = code;
-      audit?.({ kind: 'pair.challenge', deviceId: entry.deviceId, detail: { name: entry.name } });
-      return { challenge, code, deviceId: entry.deviceId };
+      audit?.({ kind: 'pair.challenge', deviceId, detail: { name: session.deviceName, pending: true } });
+      return { challenge, code, deviceId };
     },
 
     /**
@@ -111,13 +124,14 @@ export function createPairingService({ keys, tickets, devices, ttlMs, logger, au
       if (!session) {
         throw new PairingError('pair/invalid-token', '配对会话不存在或挑战不匹配');
       }
-      const device = devices.get(session.deviceId);
-      if (!device) throw new PairingError('pair/revoked', '设备已在配对期间被撤销');
-      const verdict = tickets.verifyChallenge(b64d(device.pubKey, 'pubKey'), session.deviceId, challenge, sig, ts);
+      // 验签用会话里暂存的公钥（尚未入 ACL）；deviceId 也是它的纯函数。
+      const verdict = tickets.verifyChallenge(b64d(session.pubKey, 'pubKey'), session.deviceId, challenge, sig, ts);
       if (!verdict.ok) {
         audit?.({ kind: 'pair.reject', deviceId: session.deviceId, detail: { reason: verdict.reason } });
         throw new PairingError('pair/verify-failed', `挑战验证失败：${verdict.reason}`);
       }
+      // ★ P2：验签通过**之后**才写设备表 —— 未完成的配对不会留下幽灵设备条目。
+      const device = await devices.upsert({ pubKey: session.pubKey, name: session.deviceName ?? session.name, kind: 'thin' });
       const ticket = tickets.issue(session.deviceId);
       audit?.({ kind: 'pair.success', deviceId: session.deviceId, detail: { name: device.name } });
       pending.delete(session.token);

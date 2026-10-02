@@ -61,6 +61,10 @@ console.log(`模拟 DSH 主页: http://127.0.0.1:${port}/`);
 
 // ---- 无头 Chrome + CDP ----
 const chrome = spawn(CHROME, [
+  // ★ --no-sandbox 必需：受限文件沙箱下 Chrome 写不了 Crashpad 目录（Operation not permitted），
+  //   随即 SIGTRAP，页面级 CDP socket 以 1006 断开 → Runtime.enable 永远无回执。
+  //   缺了它，本测试可能静默挂起，或误连上一次遗留的浏览器实例而「假通过」。
+  '--no-sandbox',
   '--headless=new', `--remote-debugging-port=${CDP_PORT}`, '--no-first-run', '--no-default-browser-check',
   '--user-data-dir=' + path.join(os.tmpdir(), 'ra-chrome-' + Date.now()), '--window-size=1440,900', 'about:blank'
 ], { stdio: 'ignore' });

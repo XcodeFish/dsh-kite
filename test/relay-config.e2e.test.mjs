@@ -86,11 +86,20 @@ async function bootPlugin(home) {
   throw new Error('plugin boot timeout');
 }
 
+/** 轨 1 的真实来源：插件自签引导令牌（/kite/api/entry 免认证端点）。
+ *  ★ P2 已移除「宿主 launchToken 当插件管理面凭据」这条轨，测试同步改走生产同源路径。 */
+async function bootstrapToken(adminRoute) {
+  const res = mockRes();
+  await adminRoute().handler(mockReq('GET', '/kite/api/entry'), res);
+  const entryUrl = JSON.parse(res.body).url;
+  return new URLSearchParams(entryUrl.split('?')[1] ?? '').get('kite_token');
+}
+
 async function callRoute(adminRoute, method, url, bodyObj) {
-  // 全部走轨 1（launchToken）：与面板真实入口同源
+  const token = await bootstrapToken(adminRoute);
   const sep = url.includes('?') ? '&' : '?';
   const res = mockRes();
-  await adminRoute().handler(mockReq(method, `${url}${sep}kite_token=e2e-launch-token`, bodyObj), res);
+  await adminRoute().handler(mockReq(method, `${url}${sep}kite_token=${encodeURIComponent(token)}`, bodyObj), res);
   return res;
 }
 

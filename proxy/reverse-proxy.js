@@ -9,7 +9,7 @@
  * 契约测试断言：发往 loopback 的头集合 ⊆ 白名单（防回归）。
  * 响应头同样走白名单回给远端；Set-Cookie 一律剥离（设备 cookie 只由配对路径签发）。
  */
-import { safeProxyPath } from '../policy/methods.js';
+import { canonicalizeTarget } from '../policy/methods.js';
 
 const REQUEST_HEADER_WHITELIST = new Set(['content-type', 'content-disposition']);
 const RESPONSE_HEADER_WHITELIST = [
@@ -29,9 +29,19 @@ const RESPONSE_HEADER_WHITELIST = [
 ];
 const MAX_RESPONSE_BYTES = 64 * 1024 * 1024; // PWA 资产 + 页面上限；超过回 502（可读）
 
-/** 组装发往 loopback 的头（白名单唯一出口；契约测试直接测这个函数）。 */
-export function rebuildRequestHeaders(logicalHeaders, cookie) {
+/**
+ * ★ P0-4 来源标记头：连接器转发时无条件写入（值 = 进程级随机，见 index.js）。
+ * 管理面（admin/panel.js 的 adminAuth）见到它就 403 —— 把「回环 = 已认证 = 可信」
+ * 这条在代理场景下失效的假设重新拆开：经代理到达的请求永远进不了管理面。
+ */
+export const VIA_HEADER = 'x-kite-via-connector';
+
+/** 组装发往 loopback 的头（白名单唯一出口；契约测试直接测这个函数）。
+ *  ★ P0-4：`x-kite-via-connector` 在**白名单过滤之后**无条件写入 —— 手机带来的同名头
+ *  在循环里被丢弃（不在白名单里），数据流向决定它无法伪造，管理面据此拒绝经代理到达的请求。 */
+export function rebuildRequestHeaders(logicalHeaders, cookie, viaValue) {
   const headers = { cookie };
+  if (typeof viaValue === 'string' && viaValue) headers[VIA_HEADER] = viaValue;
   for (const [name, value] of Object.entries(logicalHeaders ?? {})) {
     const lower = String(name).toLowerCase();
     if (!REQUEST_HEADER_WHITELIST.has(lower)) continue;
@@ -68,25 +78,29 @@ export function filterResponseHeaders(rawHeaders) {
  * 返回 { status, headers, body:Buffer, ViaPolicyDeny?:string }。
  */
 export async function forwardRequest(deps, logical) {
-  const { credential, policy, audit, logger } = deps;
+  const { credential, policy, audit, logger, viaValue } = deps;
   const method = String(logical.method || 'GET').toUpperCase();
   if (!['GET', 'HEAD', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'].includes(method)) {
     return respond(405, { 'content-type': 'application/json' }, json({ error: 'proxy/method-not-allowed', message: `不允许的方法 ${method}` }));
   }
-  if (!safeProxyPath(logical.path)) {
+  // ★ P0-1：规范化一次，之后判定/审计/出站全部用这一个结果（禁止再解析原始串）。
+  const target = canonicalizeTarget(logical.path);
+  if (!target) {
     return respond(400, { 'content-type': 'application/json' }, json({ error: 'proxy/bad-path', message: '非法请求路径' }));
   }
 
   // ① 设备票据必须有效（authn 先于 authz：未配对设备不应获得策略判定信息）。
   if (!logical.isDeviceValid) {
+    // 审计口径：只记 pathname（query 里可能有会话标识 / 配对令牌）。
+    audit?.({ kind: 'proxy.pair-required', deviceId: logical.deviceId, method, path: target.pathname, status: 401 });
     return respond(401, { 'content-type': 'text/html; charset=utf-8' }, pairRequiredPage());
   }
 
-  // ② 策略判定（含 session/create 重写）。
+  // ② 策略判定（含 session/create 重写）—— 判定看的就是将要发出的那串。
   let body = logical.body;
-  const verdict = policy.decide({ method, path: logical.path, body });
+  const verdict = policy.decide({ method, path: target.key, body });
   if (verdict.action === 'deny') {
-    audit?.({ kind: 'policy.denied', deviceId: logical.deviceId, method, path: logical.path, status: verdict.status, reason: verdict.reason });
+    audit?.({ kind: 'policy.denied', deviceId: logical.deviceId, method, path: target.pathname, status: verdict.status, reason: verdict.reason });
     return respond(verdict.status, { 'content-type': 'application/json' }, json({ error: 'proxy/policy-denied', message: verdict.reason }));
   }
   if (verdict.action === 'rewrite') body = verdict.body;
@@ -95,13 +109,27 @@ export async function forwardRequest(deps, logical) {
   let attempt = 0;
   for (;;) {
     const { base, cookie } = await credential.acquire();
-    const url = new URL(logical.path, base);
+    // ★ P0-2：绝不再 `new URL(target, base)` —— 那会重新引入 authority 切换与点段折叠。
+    //   pathname setter 只跑 path 解析、不碰 host/port，origin 不变式是结构性 SSRF 防线：
+    //   即便 P0-1 未来被改坏，出站目标也无法离开受信 loopback origin。
+    const origin = new URL(base);
+    const url = new URL(origin.origin);
+    url.pathname = target.pathname;
+    url.search = target.search;
+    if (url.origin !== origin.origin) {
+      logger?.warn?.(`[kite] origin invariant violated: ${origin.origin} → ${url.origin}`);
+      return respond(500, { 'content-type': 'application/json' }, json({ error: 'proxy/origin-violation', message: '出站目标被改写（内部不变式）' }));
+    }
+    const timeoutSignal = AbortSignal.timeout(115_000); // 稍高于中继看门狗，确保错误来自中继的可读提示
+    const requestSignal = logical.signal
+      ? (AbortSignal.any ? AbortSignal.any([logical.signal, timeoutSignal]) : logical.signal)
+      : timeoutSignal;
     const res = await fetch(url, {
       method,
-      headers: rebuildRequestHeaders(logical.headers, cookie),
+      headers: rebuildRequestHeaders(logical.headers, cookie, viaValue),
       body: method === 'GET' || method === 'HEAD' ? undefined : body,
       redirect: 'manual',
-      signal: AbortSignal.timeout(115_000) // 稍高于中继看门狗，确保错误来自中继的可读提示
+      signal: requestSignal
     });
     if (res.status === 401 && attempt === 0) {
       attempt += 1;
@@ -123,22 +151,67 @@ export async function forwardRequest(deps, logical) {
     // 且普通响应缓冲后语义更稳）。DSH 的 LLM 流与事件流都是 text/event-stream。
     const isStreaming = /text\/event-stream/i.test(contentType);
     if (isStreaming) {
-      audit?.({ kind: 'proxy.forward-stream', deviceId: logical.deviceId, method, path: logical.path, status: res.status });
+      audit?.({ kind: 'proxy.forward-stream', deviceId: logical.deviceId, method, path: target.pathname, status: res.status });
       return { status: res.status, headers, stream: res.body };
     }
-    const buf = Buffer.from(await res.arrayBuffer());
-    if (buf.length > MAX_RESPONSE_BYTES) {
-      logger?.warn?.(`[kite] response too large (${buf.length}B) for ${logical.path}`);
+    const declaredLength = Number(rawHeaders['content-length']);
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_RESPONSE_BYTES) {
+      logger?.warn?.(`[kite] response too large (${declaredLength}B) for ${target.pathname}`);
+      try { await res.body?.cancel?.(); } catch { /* ignore */ }
       return respond(502, { 'content-type': 'application/json' }, json({ error: 'proxy/response-too-large', message: '响应超过代理上限（64 MiB）' }));
     }
-    audit?.({ kind: 'proxy.forward', deviceId: logical.deviceId, method, path: logical.path, status: res.status, bytes: buf.length });
-    return { status: res.status, headers, body: buf };
+    const buf = await readResponseBody(res, MAX_RESPONSE_BYTES);
+    if (!buf) {
+      logger?.warn?.(`[kite] response exceeded ${MAX_RESPONSE_BYTES}B for ${target.pathname}`);
+      return respond(502, { 'content-type': 'application/json' }, json({ error: 'proxy/response-too-large', message: '响应超过代理上限（64 MiB）' }));
+    }
+    /**
+     * ★ 移动端皮肤注入（deps.mobileSkin，可选）：只对**缓冲路径**的 HTML 生效。
+     *   为什么必须在 canonicalize 收口之后做：这是「已判定、已在途」的响应改写，
+     *   与请求目标解析无关，不会重新引入两种解析 —— 但它必须同步修正
+     *   content-length / etag 并强制 no-store，否则浏览器会按旧长度截断或拿缓存。
+     *   未注入该 dep 时完全零开销（生产默认不开）。
+     */
+    let outBuf = buf;
+    let outHeaders = headers;
+    if (typeof deps.mobileSkin === 'function') {
+      const patched = deps.mobileSkin({ method, path: target.key, status: res.status, headers, body: buf });
+      if (patched && patched.body) {
+        outBuf = patched.body;
+        outHeaders = patched.headers ?? headers;
+      }
+    }
+    audit?.({ kind: 'proxy.forward', deviceId: logical.deviceId, method, path: target.pathname, status: res.status, bytes: outBuf.length });
+    return { status: res.status, headers: outHeaders, body: outBuf };
   }
 }
 
 function respond(status, headers, body) {
   return { status, headers, body };
 }
+
+async function readResponseBody(res, maxBytes) {
+  if (!res.body) return Buffer.alloc(0);
+  const reader = res.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return Buffer.concat(chunks, total);
+      if (!value || value.length === 0) continue;
+      total += value.length;
+      if (total > maxBytes) {
+        try { await reader.cancel('response too large'); } catch { /* ignore */ }
+        return null;
+      }
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    try { reader.releaseLock(); } catch { /* ignore */ }
+  }
+}
+
 function json(obj) {
   return Buffer.from(JSON.stringify(obj), 'utf8');
 }

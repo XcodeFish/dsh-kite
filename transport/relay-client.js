@@ -12,15 +12,83 @@ import { deviceCookieFrom } from '../identity/pairing.js';
 import { newChallenge } from '../identity/ticket.js';
 import { forwardRequest } from '../proxy/reverse-proxy.js';
 import { openLoopbackBridge } from '../proxy/upgrade.js';
+import { canonicalizeTarget } from '../policy/methods.js';
 import { randomUUID } from 'node:crypto';
 import { gzipSync } from 'node:zlib';
 
 const RETRY_BASE_MS = 1000;
 const RETRY_MAX_MS = 30_000;
+const HELLO_ACK_TIMEOUT_MS = 10_000;
+const MAX_SEND_BUFFER_BYTES = 8 * 1024 * 1024;
 /** 单请求体聚合上限（PWA 模式；上传被策略层默认拒绝，此上限只防滥用）。 */
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 /** 子协议 token 允许的字符（RFC7230 token 子集）；不满足则退化为 URL 查询参数。 */
 const SAFE_TOKEN = /^[A-Za-z0-9._~-]+$/;
+
+/** 客户端 WebSocket API 允许的线上 close code；协议语义映射到私有 4xxx。 */
+function toClientCloseCode(code) {
+  if (code === 1000 || (code >= 3000 && code <= 4999)) return code;
+  // RFC 控制码映射到可发送的私有码；其它异常输入统一落到合法上界。
+  if (Number.isInteger(code) && code >= 1001 && code <= 1015) return 4000 + (code - 1000);
+  return 4999;
+}
+
+/** close reason 按 WebSocket 的 123 字节上限截断，而不是按字符数猜测。 */
+function clientCloseReason(reason) {
+  const text = String(reason ?? '');
+  if (!text) return undefined;
+  let out = text;
+  while (Buffer.byteLength(out, 'utf8') > 123) out = out.slice(0, -1);
+  return out || undefined;
+}
+
+/** 挑战应答会话的保留时长（票据时间窗是 ±60s，5 分钟足够宽裕）。 */
+const AUTH_CHALLENGE_TTL_MS = 5 * 60 * 1000;
+/** 未完成挑战的上限（防已认证设备刷帧把 Map 撑大）。 */
+const AUTH_CHALLENGE_MAX = 256;
+
+/**
+ * ★ 把 ws 的 `event.data` 归一化成 Buffer（同步能转的转，转不了的返回 null）。
+ *
+ * 真机事故 2026-10-02（「刷新后又开始长时间重新连接中」的**直接根因**）：
+ *   Node 内置 WebSocket（undici）的 `binaryType` 默认是 **'blob'** —— 中继一旦发
+ *   二进制承载帧（载荷 ≥4096B 就切，见 frames.js 的 isBinEligible），event.data 就是 Blob。
+ *   旧代码 `Buffer.from(event.data)` 对 Blob 立刻抛
+ *   「The first argument must be of type string or an instance of Buffer, ArrayBuffer,
+ *     or Array or an Array-like Object. Received an instance of Blob」，
+ *   而 onmessage 的 catch 把**任何**解析异常都判成协议错误 → close(1002) + 重连。
+ *   于是形成死循环：连上 → 中继发第一个大帧（session/list 451KB、mux opening snapshot…）
+ *   → 立即断 → 1s 后重连 → 再断……界面永远停在「重新连接中」。
+ *   **刷新治不了**：刷新只是把这个循环从头再跑一遍。
+ *   审计铁证：`relay.protocol-error … Received an instance of Blob`（audit.jsonl）。
+ *
+ * 修法必须两层，缺一不可：
+ *   ① 建连时显式 `binaryType='arraybuffer'`（支持的运行时直接绕开 Blob）；
+ *   ② 解码口仍然兼容 Blob/ArrayBuffer/TypedArray —— 绝不依赖①生效
+ *      （旧运行时 / 浏览器 / 未来实现），否则同一类崩溃换个运行时又回来。
+ */
+export function binaryToBuffer(data) {
+  if (Buffer.isBuffer(data)) return data;
+  if (data instanceof ArrayBuffer) return Buffer.from(data);
+  if (ArrayBuffer.isView(data)) return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+  return null; // Blob 等异步形态：调用方 await arrayBuffer()
+}
+
+/** 二进制/文本消息 → Buffer（含 Blob 异步路径）。仅用于确知非字符串的入参。 */
+async function dataToBuffer(data) {
+  const sync = binaryToBuffer(data);
+  if (sync) return sync;
+  if (typeof data?.arrayBuffer === 'function') return Buffer.from(await data.arrayBuffer());
+  throw new TypeError(`unsupported ws message type: ${Object.prototype.toString.call(data)}`);
+}
+
+/** 审计用路径：只保留 pathname 形态（去 query/控制字符并截断）——审计文件会被面板完整展示。 */
+function auditPathOf(raw) {
+  const s = typeof raw === 'string' ? raw : '';
+  const cut = s.split(/[?#]/, 1)[0];
+  // eslint-disable-next-line no-control-regex
+  return cut.replace(/[\u0000-\u001f\u007f]/g, '').slice(0, 200) || '/';
+}
 
 export class RelayConnector {
   #deps;
@@ -28,6 +96,8 @@ export class RelayConnector {
   #state = 'standby';
   #retryAttempt = 0;
   #retryTimer = null;
+  #retrySocket = null;
+  #helloTimer = null;
   #disposed = false;
   #streams = new Map(); // streamId → { deviceId, method, path, headers, chunks: [], bytes, wsBridge? }
   #authChallenges = new Map(); // channel → challenge
@@ -69,9 +139,14 @@ export class RelayConnector {
   dispose() {
     this.#disposed = true;
     clearTimeout(this.#retryTimer);
+    clearTimeout(this.#helloTimer);
     this.#retryTimer = null;
+    this.#retrySocket = null;
     this.#closeSocket(1000, 'disposed');
-    for (const stream of this.#streams.values()) stream.wsBridge?.close();
+    for (const stream of this.#streams.values()) {
+      stream.abortController?.abort('relay disconnected');
+      stream.wsBridge?.close();
+    }
     this.#streams.clear();
     this.#state = 'standby';
   }
@@ -104,6 +179,9 @@ export class RelayConnector {
       return this.#recordDrop('socket_not_open', { readyState: this.#ws?.readyState ?? null, kind: frame?.kind });
     }
     try {
+      if (Number(this.#ws.bufferedAmount ?? 0) > MAX_SEND_BUFFER_BYTES) {
+        return this.#recordDrop('socket_buffer_full', { bufferedAmount: this.#ws.bufferedAmount, kind: frame?.kind });
+      }
       if (this.#binNegotiated && isBinEligible(frame)) {
         this.#ws.send(encodeBinFrame(frame), { binary: true });
       } else {
@@ -123,13 +201,17 @@ export class RelayConnector {
       return;
     }
     this.#state = this.#retryAttempt === 0 ? 'connecting' : 'retrying';
+    this.#retrySocket = null;
     const base = String(this.#deps.relayUrl).replace(/\/+$/, '');
     // connectorId 走查询参数（中继路由键；指纹是长期身份，密钥不变则不变）。
     let url = `${base}/connector?c=${encodeURIComponent(this.#deps.connectorId)}`;
     const protocols = ['ra.v1'];
     if (this.#deps.relayToken) {
-      if (SAFE_TOKEN.test(this.#deps.relayToken)) protocols.push(`ra-bearer.${this.#deps.relayToken}`);
-      else url += `&token=${encodeURIComponent(this.#deps.relayToken)}`;
+      if (!SAFE_TOKEN.test(this.#deps.relayToken)) {
+        this.#scheduleRetry(new Error('relay token contains characters unsupported by WebSocket subprotocol'));
+        return;
+      }
+      protocols.push(`ra-bearer.${this.#deps.relayToken}`);
     }
     let ws;
     try {
@@ -139,46 +221,107 @@ export class RelayConnector {
       return;
     }
     this.#ws = ws;
+    /**
+     * ★ 显式声明二进制承载形态（真机事故 2026-10-02）。
+     *   Node 内置 WebSocket（undici）默认 binaryType='blob'，中继发来的二进制承载帧
+     *   会以 Blob 形态到达 —— 旧代码对它调 Buffer.from 立即抛错，被 onmessage 的
+     *   catch 判成协议错误 → close(1002) → 重连 → 再遇大帧 → 再断，形成无限
+     *   「重新连接中」。这里要求 arraybuffer，从源头拿到可同步解码的形态。
+     *   注意：setter 在不支持的运行时可能抛错/忽略 —— 用 try 包住，真正的兜底是
+     *   dataToBuffer() 的 Blob 分支（两层缺一不可，见其注释）。
+     */
+    try {
+      ws.binaryType = 'arraybuffer';
+    } catch {
+      /* 极旧运行时无此属性：由 dataToBuffer 的 Blob 异步路径兜底 */
+    }
+    // 强制拆连接的兜底见 #closeSocket 的「已知边界」说明：undici 无 terminate()，
+    // 且 AbortSignal 对已建立连接无效 —— 对端不回应时由中继侧 keepalive 回收。
     this.#metrics.connects += 1;
     if (this.#retryAttempt > 0) this.#metrics.reconnects += 1;
     ws.onopen = () => {
       // hello 在 open 后即发；relay 回 hello-ack 才算 established。
       // caps 'bin'：宣告支持二进制承载帧（大载荷免 b64+JSON 膨胀）。
       this.send({ kind: 'hello', proto: 1, caps: ['http', 'ws', 'pair', 'auth', 'bin'], nonce: randomUUID() });
+       clearTimeout(this.#helloTimer);
+       this.#helloTimer = setTimeout(() => {
+         if (this.#ws !== ws || this.#state === 'open') return;
+         this.#deps.logger?.warn?.('[kite] relay hello-ack timeout; retrying');
+         this.#closeSocket(1012, 'hello timeout');
+         this.#scheduleRetry(new Error('relay hello-ack timeout'), ws);
+       }, HELLO_ACK_TIMEOUT_MS);
+       this.#helloTimer.unref?.();
     };
+    /**
+     * ★ 入站解码必须**串行**（真机事故 2026-10-02）：
+     *   Blob 兜底路径是异步的（await arrayBuffer()）。若直接 async onmessage，
+     *   两次投递会并发交错 —— 先到的 Blob 后解出，帧顺序被打乱，中继侧的
+     *   revision 连续性直接崩掉。用一条链把「投递顺序 = 解码顺序 = 派发顺序」钉死。
+     *   arraybuffer 形态下全程同步，链上不留悬挂 promise，零额外延迟。
+     */
+    let rxChain = Promise.resolve();
     ws.onmessage = (event) => {
-      this.#metrics.framesIn += 1;
-      let frame;
-      try {
-        // ★ 二进制消息 = 二进制承载帧（'bin' 协商后中继才可能发）；文本 = JSON 帧。
-        frame = typeof event.data === 'string'
-          ? decodeFrame(event.data)
-          : decodeBinFrame(Buffer.isBuffer(event.data) ? event.data : Buffer.from(event.data));
-      } catch (error) {
-        this.#deps.audit?.({ kind: 'relay.protocol-error', reason: error.message });
-        this.#closeSocket(1002, 'protocol error');
-        this.#scheduleRetry(error);
-        return;
-      }
-      this.#dispatch(frame);
+      // 旧 socket 的迟到消息不能污染新连接；入队前先挡一次。
+      if (this.#ws !== ws) return;
+      const data = event.data;
+      rxChain = rxChain.then(async () => {
+        // Blob.arrayBuffer() 有异步窗口，等待期间 socket 可能已被替换。
+        if (this.#ws !== ws) return;
+        this.#metrics.framesIn += 1;
+        let frame;
+        try {
+          // ★ 二进制消息 = 二进制承载帧（'bin' 协商后中继才可能发）；文本 = JSON 帧。
+          //   非字符串一律走 dataToBuffer：它同步处理 Buffer/ArrayBuffer/TypedArray，
+          //   并异步兜底 Blob —— 绝不再出现「Blob 直接喂 Buffer.from 就炸」。
+          frame = typeof data === 'string'
+            ? decodeFrame(data)
+            : decodeBinFrame(await dataToBuffer(data));
+        } catch (error) {
+          if (this.#ws !== ws) return;
+          this.#deps.audit?.({ kind: 'relay.protocol-error', reason: error.message });
+          this.#closeSocket(1002, 'protocol error');
+          this.#scheduleRetry(error, ws);
+          return;
+        }
+        if (this.#ws !== ws) return;
+        this.#dispatch(frame);
+      }).catch((error) => {
+        // 链自身绝不中断：一次异常不能把后续所有入站帧静默吞掉。
+        this.#deps.logger?.warn?.(`[kite] relay inbound handler failed: ${error?.message ?? error}`);
+      });
     };
     ws.onclose = (event) => {
+      /**
+       * ★ 只有「当前这条 socket」的 close 才有权改状态（2026-10-02）。
+       *   旧代码无条件 `this.#ws = null` —— 一条**已被替换**的旧 socket 迟到的 close
+       *   会把刚建好的新连接引用抹掉：send() 从此恒返回 socket_not_open，
+       *   面板上却显示着「已连接」，直到下一次重连才自愈。
+       *   中继侧 `connectors.get(id)?.close(4000,'replaced')`（多实例抢座）正好制造
+       *   这种「旧连接被踢、新连接刚装上」的交错窗口，实测该码出现 141 次。
+       *   这里以身份比较为准：不是当前 socket 的 close 直接忽略，不碰任何状态。
+       */
+      if (this.#ws !== ws) return;
       const wasOpen = this.#state === 'open';
       this.#ws = null;
       if (this.#disposed || this.#state === 'killed') return;
       this.#metrics.lastError = `closed ${event.code} ${event.reason || ''}`.trim();
-      for (const stream of this.#streams.values()) stream.wsBridge?.close();
+      for (const stream of this.#streams.values()) {
+      stream.abortController?.abort('relay disconnected');
+      stream.wsBridge?.close();
+    }
       this.#streams.clear();
       if (wasOpen) this.#retryAttempt = 0;
-      this.#scheduleRetry(new Error(`relay closed (${event.code})`));
+      this.#scheduleRetry(new Error(`relay closed (${event.code})`), ws);
     };
     ws.onerror = () => {
       /* onclose 会跟着来；错误细节在中继侧 */
     };
   }
 
-  #scheduleRetry(error) {
+  #scheduleRetry(error, failedWs = null) {
     if (this.#disposed || this.#state === 'killed') return;
+    if (failedWs && this.#retrySocket === failedWs) return;
+    if (failedWs) this.#retrySocket = failedWs;
     this.#state = 'retrying';
     this.#metrics.lastError = error?.message ?? String(error);
     const delay = Math.min(RETRY_MAX_MS, RETRY_BASE_MS * 2 ** this.#retryAttempt) + Math.floor(Math.random() * 500);
@@ -191,17 +334,62 @@ export class RelayConnector {
     this.#retryTimer.unref?.();
   }
 
+  /**
+   * 主动关闭当前 socket。
+   *
+   * ★ 真机事故 2026-10-02（第二个独立根因，与 Blob 那条叠加）：
+   *   Node 内置 WebSocket（undici）**只接受 1000 与 3000–4999 作为 close code**；
+   *   传 1002/1001/1011 会抛 `DOMException [InvalidAccessError]: invalid code`。
+   *   而旧代码把 `ws.close(code, reason)` 整个包在 `try { … } catch { /* ignore *\/ }` 里 ——
+   *   异常被静默吞掉，**一个字节都没发出去，socket 也没关**。后果：
+   *     · 协议错误路径（close(1002)）根本关不掉连接 → 旧 socket 变僵尸；
+   *     · 重试计时器照样排 → 新建一条 → 中继侧同 id 抢座 close(4000,'replaced')
+   *       把**新**的那条踢掉 …… 实测线上 `code=4000` 累计 **141 次**、中继
+   *       `connectors` 长期显示 **2**（幽灵条目永不复位），手机端则表现为
+   *       「重新连接中」长跑不停。
+   *     · kill switch 的「立即断开」同样落空。
+   *
+   *   修法：把调用方给的语义码映射成合法线上码（1002 → 4002，语义写进 reason），
+   *   让 close 帧**真的发出去**；这条路径通了，中继就能立刻回收该连接器条目。
+   *
+   * ⚠ 已知边界（诚实记录，勿据此以为能「强拆」）：undici 的 WebSocket
+   *   **没有 terminate()**，且一旦对端不回应 close 帧，它没有任何内置超时——
+   *   实测 socket 会长期停在 readyState=2（CLOSING），AbortSignal 对**已建立**的
+   *   连接也无效（只作用于握手阶段）。因此这里不做「伪强拆」；真正的兜底在中继侧：
+   *   RELAY_CONNECTOR_PING_MS（默认 30s）ping 无 pong 即 terminate，由中继清理。
+   *   旧代码的 `ws.terminate?.()` 在这条链上恒为 no-op —— 那才是「看起来有兜底、
+   *   实际什么都没有」的第三层静默失效。
+   */
   #closeSocket(code, reason) {
+    const ws = this.#ws;
+    if (!ws) return;
+    /**
+     * close code 合法性：1000 与 3000–4999 才被 undici 接受。
+     * 其它（1001/1002/1003/1005/1006/1011/1012/1013/1015…）一律映射到 4xxx，
+     * 否则 close() 抛错 → 连接永远不关（旧行为的真凶）。
+     * 映射保持可辨识：RFC 控制码映射到 4000+低位，其它异常输入落到 4999。
+     */
+    const wireCode = toClientCloseCode(code);
+    const wireReason = clientCloseReason(reason);
     try {
-      this.#ws?.close(code, reason);
-    } catch {
-      /* ignore */
+      ws.close(wireCode, wireReason);
+    } catch (error) {
+      // 映射后仍抛错（未来运行时收紧规则）必须留下痕迹 —— 绝不静默。
+      this.#deps.logger?.warn?.(`[kite] relay close(${wireCode}) failed: ${error?.message ?? error}`);
     }
+    // 非 undici 运行时（如 `ws` 包）有真 terminate，1s 后补一刀；undici 上这是 no-op，
+    // 由中继侧 keepalive 兜底（见上方「已知边界」）。
+    const force = setTimeout(() => {
+      try { ws.terminate?.(); } catch { /* 已关 / undici 无此方法 */ }
+    }, 1000);
+    force.unref?.();
   }
 
   #dispatch(frame) {
     switch (frame.kind) {
       case 'hello-ack': {
+        clearTimeout(this.#helloTimer);
+        this.#helloTimer = null;
         this.#state = 'open';
         this.#retryAttempt = 0;
         this.#metrics.lastError = null; // 建立成功即清残留错误（面板不再显示历史抖动）
@@ -226,6 +414,8 @@ export class RelayConnector {
           headers: frame.headers ?? {},
           chunks: [],
           bytes: 0,
+          socket: this.#ws,
+          abortController: new AbortController(),
           cookieOverride: frame.headers?.cookie
         });
         return;
@@ -249,15 +439,47 @@ export class RelayConnector {
         if (frame.final) void this.#handleHttp(frame.streamId, stream);
         return;
       }
+      case 'http-cancel': {
+        const stream = this.#streams.get(frame.streamId);
+        if (stream?.abortController) stream.abortController.abort(frame.reason ?? 'relay cancelled');
+        if (stream?.channel) {
+          this.#streams.delete(`ch:${stream.channel}`);
+          this.#streams.delete(`pair:${stream.channel}`);
+        }
+        this.#streams.delete(frame.streamId);
+        return;
+      }
       case 'ws-open': {
         const deviceId = this.#resolveDevice(frame.deviceId, frame.headers?.cookie);
         if (!deviceId) {
           this.send({ kind: 'ws-close', deviceId: frame.deviceId, streamId: frame.streamId, code: 4401 });
           return;
         }
+        // ★ P0-3：WS 不是后门 —— 与 HTTP 完全相同的门：kill switch 复检 + 规范化 + 策略判定。
+        //   旧实现把 frame.path 直接交给 openLoopbackBridge，于是「HTTP 侧被拒的路径在 WS 侧照通」，
+        //   且 `//127.0.0.1:9999/x` 可打任意回环端口（还带 dsh-auth 凭据）。
+        if (this.#deps.isKilled?.()) {
+          this.#deps.audit?.({ kind: 'ws.reject', deviceId, reason: 'kill-switch', path: auditPathOf(frame.path) });
+          this.send({ kind: 'ws-close', deviceId, streamId: frame.streamId, code: 4403 });
+          return;
+        }
+        const target = canonicalizeTarget(frame.path);
+        if (!target) {
+          this.#deps.audit?.({ kind: 'ws.reject', deviceId, reason: 'bad-path', path: auditPathOf(frame.path) });
+          this.send({ kind: 'ws-close', deviceId, streamId: frame.streamId, code: 4400 });
+          return;
+        }
+        const verdict = this.#deps.policy?.decide?.({ method: 'GET', path: target.key });
+        if (verdict && verdict.action === 'deny') {
+          this.#deps.audit?.({ kind: 'ws.reject', deviceId, reason: verdict.reason, path: target.pathname });
+          this.send({ kind: 'ws-close', deviceId, streamId: frame.streamId, code: 4403 });
+          return;
+        }
         const bridge = openLoopbackBridge(this.#deps, {
           streamId: frame.streamId,
-          path: frame.path,
+          pathname: target.pathname,
+          search: target.search,
+          deviceId,
           onReady: () => this.send({ kind: 'ws-accept', deviceId, streamId: frame.streamId }),
           onFrame: (msg) => {
             // ★ 下行绝不允许静默挖洞（2026-10-01）。
@@ -315,6 +537,11 @@ export class RelayConnector {
     }
   }
 
+  #canSendStream(streamId, stream) {
+    return Boolean(stream && !stream.abortController?.signal.aborted
+      && this.#streams.get(streamId) === stream && this.#ws === stream.socket);
+  }
+
   #dropStream(streamId, reason) {
     const stream = this.#streams.get(streamId);
     this.#streams.delete(streamId);
@@ -335,8 +562,22 @@ export class RelayConnector {
   }
 
   async #handleHttp(streamId, stream) {
-    this.#streams.delete(streamId);
+    // ★ P1-1：kill switch 逐请求复检。从「点了开关」到「WS 真的关掉」之间存在窗口
+    //   （在途帧、重连竞态），复检是零成本兜底 —— 承诺「立即断开」就必须立即断开。
+    if (this.#deps.isKilled?.()) {
+      this.#streams.delete(streamId);
+      this.send({
+        kind: 'http-error',
+        deviceId: stream?.deviceId ?? 'unknown',
+        streamId,
+        code: 'proxy/killed',
+        status: 503,
+        message: '远程访问已紧急停用（kill switch）'
+      });
+      return;
+    }
     this.#metrics.httpRequests += 1;
+    stream.handling = true;
     const body = stream.chunks.length === 1 ? stream.chunks[0] : Buffer.concat(stream.chunks);
     try {
       // 保留路径：PWA 配对页（无票据也可达；只接受配对令牌）。
@@ -372,6 +613,7 @@ export class RelayConnector {
             this.publishDevices();
           }
           this.#sendHttpResponse(stream.deviceId, streamId, res, stream);
+          this.#streams.delete(streamId);
           return;
         }
       }
@@ -382,10 +624,15 @@ export class RelayConnector {
         path: stream.path,
         headers: stream.headers,
         body,
-        isDeviceValid: Boolean(deviceId)
+        isDeviceValid: Boolean(deviceId),
+        signal: stream.abortController?.signal
       });
       this.#sendHttpResponse(stream.deviceId, streamId, result, stream);
+      if (!result.stream) this.#streams.delete(streamId);
     } catch (error) {
+      this.#streams.delete(streamId);
+      if (stream.abortController?.signal.aborted || error?.name === 'AbortError') return;
+      if (!this.#canSendStream(streamId, stream)) return;
       this.#deps.logger?.warn?.(`[kite] forward failed: ${error.message}`);
       // ★ 业务性错误用 4xx（配对令牌无效等），不得伪装成 502 网关故障 ——
       // Cloudflare 等前置代理会用自有 HTML 覆盖 502，导致前端 JSON 解析崩溃。
@@ -413,12 +660,13 @@ export class RelayConnector {
   async #sendHttpStream(deviceId, streamId, res, stream) {
     this.send({ kind: 'http-res-head', deviceId, streamId, status: res.status, headers: res.headers ?? {} });
     const reader = res.stream.getReader();
-    const signal = stream.streamAbort?.signal;
+    const signal = stream.abortController?.signal;
+    let completed = false;
     try {
       for (;;) {
         if (signal?.aborted) break;
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) { completed = true; break; }
         if (!value || value.length === 0) continue;
         // 分片成 ≤MAX_CHUNK_BYTES 的帧
         for (let offset = 0; offset < value.length; offset += MAX_CHUNK_BYTES) {
@@ -430,11 +678,18 @@ export class RelayConnector {
       }
     } catch (error) {
       this.#deps.logger?.warn?.(`[kite] stream read failed: ${error.message}`);
+      if (!signal?.aborted) this.send({ kind: 'http-error', deviceId, streamId, code: 'proxy/stream-failed', status: 502, message: '上游流读取失败' });
+      this.#streams.delete(streamId);
+      return;
     } finally {
       try { reader.releaseLock(); } catch { /* 已释放 */ }
     }
-    // 终止帧（final: true + 空 chunk）
-    this.send({ kind: 'http-res-body', deviceId, streamId, chunk: '', final: true });
+    if (completed) {
+      this.send({ kind: 'http-res-body', deviceId, streamId, chunk: '', final: true });
+      this.#streams.delete(streamId);
+    } else if (signal?.aborted) {
+      this.#streams.delete(streamId);
+    }
   }
 
   #sendHttpResponse(deviceId, streamId, res, stream) {
@@ -529,9 +784,25 @@ export class RelayConnector {
       this.send({ kind: 'auth-result', channel: frame.channel, ok: false, error: 'unknown device' });
       return;
     }
+    // ★ P2：被弃条目（auth-begin 后未完成）此前只增不减 —— 已认证设备可以无限刷。
+    //   过期清扫 + 容量上限（超限时丢最旧的一条），完成后仍即时删除（见 #handleAuthDone）。
+    this.#sweepAuthChallenges();
     const challenge = newChallenge();
-    this.#authChallenges.set(`auth:${frame.channel}`, { challenge, deviceId });
+    this.#authChallenges.set(`auth:${frame.channel}`, { challenge, deviceId, at: Date.now() });
     this.send({ kind: 'auth-challenge', channel: frame.channel, challenge });
+  }
+
+  /** 清扫过期/超量的未完成挑战（容量语义：超限丢最旧）。 */
+  #sweepAuthChallenges() {
+    const now = Date.now();
+    for (const [key, entry] of this.#authChallenges) {
+      if (now - (entry.at ?? 0) > AUTH_CHALLENGE_TTL_MS) this.#authChallenges.delete(key);
+    }
+    while (this.#authChallenges.size >= AUTH_CHALLENGE_MAX) {
+      const oldest = this.#authChallenges.keys().next();
+      if (oldest.done) break;
+      this.#authChallenges.delete(oldest.value);
+    }
   }
 
   #handleAuthDone(frame) {
@@ -646,7 +917,7 @@ export function probeRelay({ relayUrl, relayToken, timeoutMs = 10_000 } = {}) {
       const protocols = ['ra.v1'];
       if (relayToken) {
         if (SAFE_TOKEN.test(relayToken)) protocols.push(`ra-bearer.${relayToken}`);
-        else full += `&token=${encodeURIComponent(relayToken)}`;
+        else { resolve({ ok: false, code: 'format', reason: '令牌含不支持的字符；请使用 RFC token 字符，避免令牌进入 URL' }); return; }
       }
       let ws;
       let settled = false;
@@ -664,19 +935,30 @@ export function probeRelay({ relayUrl, relayToken, timeoutMs = 10_000 } = {}) {
         done({ ok: false, code: 'format', reason: `WebSocket 建立失败：${String(error?.message ?? error).slice(0, 140)}` });
         return;
       }
+      // 与主连接同一纪律：显式要求 arraybuffer，避免二进制帧以 Blob 形态到达。
+      try {
+        ws.binaryType = 'arraybuffer';
+      } catch {
+        /* 极旧运行时：由 dataToBuffer 的 Blob 异步路径兜底 */
+      }
       ws.onmessage = (event) => {
-        let frame;
-        try {
-          // 预检握手只收 hello-ack（JSON 文本帧），但按协议宽容解析二进制
-          frame = typeof event.data === 'string'
-            ? decodeFrame(event.data)
-            : decodeBinFrame(Buffer.isBuffer(event.data) ? event.data : Buffer.from(event.data));
-        } catch {
-          done({ ok: false, code: 'server', reason: '中继返回了无法解析的帧（部署的可能不是本中继）' });
-          return;
-        }
-        if (frame.kind === 'hello-ack') done({ ok: true, code: 'ok', latencyMs: Date.now() - startedAt, proto: frame.proto });
-        else done({ ok: false, code: 'server', reason: `中继握手返回了非预期帧（${frame.kind}）` });
+        const data = event.data;
+        // 预检握手只收 hello-ack（JSON 文本帧），但按协议宽容解析二进制。
+        // ★ 不能用「同步 try/catch 包住 await」的写法：必须先把 promise 接住再判错，
+        //   否则 Blob 路径的 rejection 会逃逸成 unhandledRejection（探针反而假通过）。
+        void (async () => {
+          let frame;
+          try {
+            frame = typeof data === 'string'
+              ? decodeFrame(data)
+              : decodeBinFrame(await dataToBuffer(data));
+          } catch {
+            done({ ok: false, code: 'server', reason: '中继返回了无法解析的帧（部署的可能不是本中继）' });
+            return;
+          }
+          if (frame.kind === 'hello-ack') done({ ok: true, code: 'ok', latencyMs: Date.now() - startedAt, proto: frame.proto });
+          else done({ ok: false, code: 'server', reason: `中继握手返回了非预期帧（${frame.kind}）` });
+        })();
       };
       ws.onclose = () => done({ ok: false, code: 'auth', reason: '中继拒绝了令牌（healthz 可达但 /connector 握手被 401）—— 核对 relayToken 与中继 RELAY_TOKENS 是否一致' });
       ws.onerror = () => { /* onclose 跟随；分类交给 onclose */ };

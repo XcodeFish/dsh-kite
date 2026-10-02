@@ -103,19 +103,34 @@ curl -s http://127.0.0.1:8787/healthz              # 服务器本机回环
 |---|---|
 | `WSS /connector?c=<connectorId>` | Connector 出站接入（子协议 `ra-bearer.<token>` 鉴权） |
 | `WSS /device` / 其它任意路径 | 手机：HTTP/WS 全桥接到 Connector；手机侧 WS 已协商 **permessage-deflate**（实时流线上字节省 ~81%） |
-| `GET /healthz` `/metrics` | 健康检查 / Prometheus 指标 |
+| `GET /healthz` | 健康检查（公开；只含数字与计数） |
+| `GET /metrics` | Prometheus 指标（**需 `Authorization: Bearer <RELAY_TOKENS>` 或 `?token=`**，否则 404） |
 
-中继职责边界：配对转发 + 限流（单 IP 60/min、设备连接上限、1 MiB 帧上限、8 MiB 请求体上限、30s 响应看门狗）+ 连接器 keepalive（30s 无 pong 剔除）+ 手机 socket 保活（60s）。中继唯一持久化与信任判断是 **Pair-Proof 归属验签**（`owners.json`，见 §7）；不解密业务流量、不读用户数据。
+中继职责边界：配对转发 + 入口限流（`/connector` 与配对端点严格 **60/min/IP**，其余手机流量 **600/min/IP**；可用 `RELAY_RATE_*_PER_MIN` 覆盖）+ 设备上限（`MAX_DEVICES`，默认 8/连接器）+ 1 MiB 帧上限 + 8 MiB 请求体上限 + 110s 响应看门狗 + 连接器 keepalive（30s 无 pong 剔除）+ 手机 socket 保活（60s）。中继唯一持久化与信任判断是 **Pair-Proof 归属验签**（`owners.json`，见 §7）；不解密业务流量、不读用户数据。`kick` 有归属校验（非归属连接器踢不动）。
+
+**中继启动是 fail-closed**：`RELAY_TOKENS` 为空且未显式 `ALLOW_OPEN=1` 时**拒绝启动**（旧行为是静默放行一切、仅打一行日志）。本机联调用 `ALLOW_OPEN=1`，生产必须配令牌 —— 旧版以 OPEN 运行的中继升级后会拒绝启动，属预期（先配 token 再启）。日志只记 pathname，不记查询串（一次性配对令牌不落 journald）。中继侧 socket 已关 permessage-deflate 上下文接管并收窄客户端压窗口（防解压膨胀）。
 
 ## 5. 使用流程
 
-**入口**：DSH Web GUI 右下角「手机远程」悬浮按钮 → `/kite` 面板。
+**入口**：DSH Web GUI **左侧栏底部的「手机远程」条目**（与「上下文洞察」并列，在 Settings 之上）→ `/kite` 面板。
+
+入口位置由 `menuEntry` 配置控制（`cordis.patch.yml` 或 profile patch 层）：
+
+| 取值 | 效果 |
+|---|---|
+| `'sidebar'`（默认） | 仅左侧栏条目（侧栏收起时自动退化为 36px 圆形图标） |
+| `'both'` | 左侧栏条目 + 右下角悬浮按钮 |
+| `'floating'` | 仅右下角悬浮按钮（旧行为） |
+| `false` | 两者都不注入（面板仍可直接访问 `/kite`） |
+
+左侧栏条目走 `dsh.client` web 半包（`admin/sidebar-entry.js`），注册在官方槽位 `sidebar.footer.action`（`order: 20` → 排在「上下文洞察」`order: 10` 之下；改为 `order: 5` 即排到它上方）。悬浮按钮走 `webserver/index-inject`。两者共享同一套面板引擎与认证，**入口与面板是解耦的**：即便关掉悬浮按钮，`'sidebar'` 模式下仍会注入面板引擎，侧栏条目照常可用。
 
 1. 面板「生成配对二维码」→ **二维码 + 一次性链接**（2 分钟有效，用后即焚）。
 2. **手机扫码** → 手机本地生成 Ed25519 密钥（WebCrypto，私钥不可导出，存 IndexedDB）→ 挑战-应答完成配对 → 手机显示 **6 位校验码**。配对成功的那一刻，新设备已进入中继路由表（无需重连/刷新）。
-3. **核对校验码**：手机与面板一致才点「确认并进入 DSH」（用户成为信任根，防中继作恶抢配）。
+3. **核对校验码**：手机**本地计算**（`crypto.subtle`，不再显示服务端回传值），面板侧独立算同一个值，一致才点「确认并进入 DSH」。算法与 `identity/pairing.js` 的 `verificationCode()` 逐字节一致：`SHA256(设备公钥B64 ‖ "|" ‖ 连接器公钥B64)` 取**前 3 字节大端序** `% 1000000`，再左补零到 6 位（**不是**「摘要前 6 个字符」——那会得到完全不同的数字）。连接器公钥来自**桌面面板生成的配对链接**（`&pk=`），不经中继转手 —— 中继若偷换手机提交的公钥，两端数字必然不一致。
+   **边界（如实说明）**：配对页的 JS 本身经中继下发，一个能改写页面的中继同样能改写这段本地计算，所以校验码**挡不住「能改写客户端的中继」**；它能挡住的是字段替换/竞速式中继，以及从日志读到配对令牌后抢配的第三方。要对抗恶意中继，只有 thin-client sealed 模式或局域网/Tailscale 直连（见 §7）。
 4. 之后手机访问中继即得完整 PWA；设备票据 12h，过期后凭私钥免扫码重连。
-5. 撤销：面板单台/全部撤销，即时生效并断开在线连接；**kill switch** 立即断开中继并停止重连（持久化，重启 DSH 后仍生效）。
+5. 撤销：面板单台/全部撤销，即时生效并断开在线连接；**kill switch** 立即断开中继并停止重连（持久化，重启 DSH 后仍生效），且对**在途请求**逐个复检（HTTP 503 / WS 4403），不是只写文件。
 
 ### 手机怎么访问（三条路径，按场景选）
 
@@ -142,8 +157,8 @@ curl -s http://127.0.0.1:8787/healthz              # 服务器本机回环
 
 ## 7. 安全边界与残余风险
 
-- **信任链**：手机私钥（不可导出）→ 设备公钥 ACL（Connector 本地 0600）→ 一次性配对 token（120s、用后即焚、timingSafeEqual）→ 6 位校验码（SHA256(devPub‖connPub)，防中继抢配）→ 挑战-应答票据（12h、nonce LRU、±60s 时间窗、counter 单调）。
-- **PWA 模式的 TLS 终结点在中继**（E2E 不适用于未改造的 PWA）。thin-client sealed 模式（X25519+HKDF+AEAD，中继只见密文）的加密原语与帧已就绪（`transport/e2e.js`）。
+- **信任链**：手机私钥（不可导出）→ 设备公钥 ACL（Connector 本地 0600）→ 一次性配对 token（120s、用后即焚、timingSafeEqual）→ 6 位校验码（SHA256(devPub‖connPub)，手机本地计算，**防公钥替换/竞速抢配**；不改写页面的中继）→ 挑战-应答票据（12h、nonce LRU、±60s 时间窗、counter 单调）。
+- **PWA 模式的 TLS 终结点在中继**（E2E 不适用于未改造的 PWA）。thin-client sealed 模式（X25519+HKDF+AEAD，中继只见密文）的加密原语与帧已就绪，**但 `transport/e2e.js` 目前仅被测试引用、未接生产链路，且是裸 ECDH 无认证 —— 不能算既有防线**，只是待交付的半成品。
 - 配对链接泄露窗口 = 120s 且单次有效；**真正的长期凭据是设备私钥**（在手机里），不是 URL。
 - 残余风险：Connector 持全权 loopback cookie（单一信任点，靠小代码量 + 审计 + host-adapter 收口）；中继域名被劫持时 PWA 模式退化为「对中继的 TLS 信任」；手机丢失 → 面板一键撤销。
 - **Pair-Proof（设备归属密码学绑定）**：配对完成时手机私钥签名 `(challenge ‖ connectorId ‖ ts)`，连接器经 `device-claim` 帧交中继自主验签，归属持久化到中继 `/var/lib/ra-relay/owners.json` —— 同 token 下任何其它机器（克隆/备份扩散的连接器）都无法声明这些设备的路由。换机 = 面板撤销 + 重扫（新密钥 → 新 claim 覆盖）。
@@ -167,7 +182,7 @@ curl -s http://127.0.0.1:8787/healthz              # 服务器本机回环
 ## 9. 测试与探针
 
 ```bash
-npm test          # 151 项测试（帧/E2E/票据/设备存储/配对/策略/凭据/重建/审计/中继集成/真机回归）
+npm test          # 183 项测试（帧/E2E/票据/设备存储/配对/策略/凭据/重建/审计/中继集成/入口模式/移动皮肤/安全回归/真机回归）
 npm run probe     # 离线宿主契约断言（DSH 升级后先跑这个）
 npm run verify    # 全链路：单测 + 面板 e2e + 配对流 + 全链 e2e + 浏览器模拟 + WS 复验
 node test/live-public-pair.verify.mjs   # 线上验收：真实走一遍公网配对 + 资源路由检查
@@ -210,8 +225,11 @@ policy/               方法黑名单 / 会话预设锁定 / 审计
 proxy/                loopback 凭据 / 反向代理 / WS 桥（RFC6455 最小编解码）
 approvals/            审批旁听审计
 admin/                管理面板 + 手机配对页 + kill switch
+                      ├─ menu-entry.js     悬浮按钮注入（webserver/index-inject）
+                      ├─ sidebar-entry.js  左侧栏条目（dsh.client web 半包，sidebar.footer.action 槽）
+                      └─ panel-client.js   面板引擎（浮层 + 认证；暴露 window.__DSH_KITE_OPEN__ 供侧栏调用）
 relay/                独立中继（唯一允许依赖 ws：server.mjs + deploy/ 一键部署包）
-test/                 151 项测试 + 离线宿主探针 + 线上验收脚本
+test/                 183 项测试 + 离线宿主探针 + 线上验收脚本 + 真机 Chrome e2e（入口模式 / 配对）
 ```
 
 ## 12. 与设计方案的有意偏差（ADR 补记）

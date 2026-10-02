@@ -142,7 +142,7 @@ const publicUrl = `http://127.0.0.1:${relayPort}/kite/pair?token=${encodeURIComp
 check('① 生成配对链接（经中继可达）', Boolean(publicUrl), publicUrl.slice(0, 60) + '…');
 
 // ---- 无头 Chrome 走完整流程 ----
-const chrome = spawn(CHROME, ['--headless=new', `--remote-debugging-port=${CDP_PORT}`, '--no-first-run', '--no-default-browser-check',
+const chrome = spawn(CHROME, ['--no-sandbox', '--headless=new', `--remote-debugging-port=${CDP_PORT}`, '--no-first-run', '--no-default-browser-check',
   '--user-data-dir=' + path.join(os.tmpdir(), 'ra-final-chrome-' + Date.now()), '--window-size=430,900', 'about:blank'], { stdio: 'ignore' });
 for (let i = 0; i < 80; i += 1) { try { if ((await fetch(`http://127.0.0.1:${CDP_PORT}/json/version`)).ok) break; } catch {} await new Promise((r) => setTimeout(r, 250)); }
 const targets = await (await fetch(`http://127.0.0.1:${CDP_PORT}/json/list`)).json();

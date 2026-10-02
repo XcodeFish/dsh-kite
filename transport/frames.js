@@ -87,6 +87,7 @@ const SPECS = {
   'http-res-head': { deviceId: ['string', true], streamId: ['string', true], status: ['number', true], headers: ['object', false] },
   'http-res-body': { deviceId: ['string', true], streamId: ['string', true], chunk: ['string', true], final: ['boolean', true] },
   'http-error': { deviceId: ['string', true], streamId: ['string', true], code: ['string', true], message: ['string', true], status: ['number', false] },
+  'http-cancel': { deviceId: ['string', true], streamId: ['string', true], reason: ['string', false] },
   'ws-open': { deviceId: ['string', true], streamId: ['string', true], path: ['string', true], headers: ['object', false] },
   'ws-accept': { deviceId: ['string', true], streamId: ['string', true] },
   'ws-data': { deviceId: ['string', true], streamId: ['string', true], fin: ['boolean', true], opcode: ['number', true], data: ['string', true] },

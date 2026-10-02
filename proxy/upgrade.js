@@ -33,12 +33,17 @@ const FRAGMENT_PAYLOAD_BYTES = 512 * 1024;
 /**
  * 打开一条到 loopback 的 WS 桥。
  * deps: { credential, logger, audit }
+ * ★ P0-3：调用方传入的必须是**已规范化**的 { pathname, search }（canonicalizeTarget 的返回值），
+ *   这里绝不接收原始请求目标 —— 旧实现 `new URL(path, base)` 让 `//127.0.0.1:9999/x`
+ *   可打任意回环端口（并带上 dsh-auth 凭据），只检查 hostname 挡不住换端口。
  * onReady(socket|null, error?) — socket 为 null 表示升级失败（调用方回 ws-close）。
  * 返回桥句柄 { toLoopback({fin,opcode,data}), close(code), streamId }。
  */
-export function openLoopbackBridge(deps, { streamId, path, onReady, onFrame, onClose }) {
+export function openLoopbackBridge(deps, { streamId, pathname, search, deviceId, onReady, onFrame, onClose }) {
   const { credential, logger, audit } = deps;
   let socket = null;
+  let request = null;
+  let upgradeTimer = null;
   let disposed = false;
   const parser = new ServerFrameParser();
   /**
@@ -61,6 +66,14 @@ export function openLoopbackBridge(deps, { streamId, path, onReady, onFrame, onC
   function fail(error) {
     if (disposed) return;
     disposed = true;
+    clearTimeout(upgradeTimer);
+    upgradeTimer = null;
+    try {
+      request?.destroy();
+    } catch {
+      /* ignore */
+    }
+    request = null;
     try {
       socket?.destroy();
     } catch {
@@ -72,15 +85,31 @@ export function openLoopbackBridge(deps, { streamId, path, onReady, onFrame, onC
 
   credential.acquire().then(({ base, cookie }) => {
     if (disposed) return;
-    const url = new URL(path, base);
-    if (url.protocol !== 'http:' || !/^127\.0\.0\.1$/.test(url.hostname)) throw new Error('unexpected loopback URL');
-    const req = http.request({
+    // ★ 只把规范化后的 pathname/search 贴到**受信 origin** 上：host 与端口都由
+    //   credential 提供，手机给不出端口。origin 不变式 = 结构性 SSRF 防线
+    //   （比逐条比对 hostname/IPv6/别名可靠）。
+    // ★ 入参形状必须显式：`pathname` 缺失即抛错，绝不 `?? '/'` 兜底 ——
+    //   否则旧签名的调用方（传 path）会静默去请求宿主根路径，而不是报错暴露。
+    if (typeof pathname !== 'string' || pathname.length === 0 || pathname[0] !== '/') {
+      throw new Error('openLoopbackBridge: pathname must be a canonical origin-form path');
+    }
+    const origin = new URL(base);
+    const url = new URL(origin.origin);
+    url.pathname = pathname;
+    url.search = typeof search === 'string' ? search : '';
+    if (url.origin !== origin.origin) throw new Error('unexpected loopback URL');
+    request = http.request({
       host: url.hostname,
       port: url.port,
       path: `${url.pathname}${url.search}`,
       headers: buildUpgradeHeaders(cookie)
     });
-    req.on('upgrade', (res, sock, head) => {
+    upgradeTimer = setTimeout(() => fail(new Error('loopback upgrade timeout')), 10_000);
+    upgradeTimer.unref?.();
+    request.on('upgrade', (res, sock, head) => {
+      clearTimeout(upgradeTimer);
+      upgradeTimer = null;
+      request = null;
       if (disposed) {
         sock.destroy();
         return;
@@ -112,18 +141,17 @@ export function openLoopbackBridge(deps, { streamId, path, onReady, onFrame, onC
         }
       });
       if (head && head.length > 0) sock.emit('data', head);
-      audit?.({ kind: 'ws.open', detail: { path } });
-      // 升级前积压的帧在这里统一放行；flushOutbox 会在遇到内核缓冲满时挂 drain 回调
-      // 并把【剩下的】继续排下去 —— 不会再出现「break 之后没人管」。
+      // ★ P2：审计带 deviceId/streamId —— 「谁、何时、开了哪条隧道」是事件响应的最低要求。
+      audit?.({ kind: 'ws.open', deviceId, streamId, detail: { path: pathname ?? '/' } });
       flushOutbox();
       onReady?.(sock);
     });
-    req.on('response', (res) => {
+    request.on('response', (res) => {
       fail(new Error(`loopback upgrade refused: HTTP ${res.statusCode}`));
-      req.destroy();
+      res.resume?.();
     });
-    req.on('error', fail);
-    req.end();
+    request.on('error', fail);
+    request.end();
   }).catch((error) => {
     logger?.warn?.(`[kite] ws bridge failed: ${error.message}`);
     fail(error);
@@ -207,12 +235,28 @@ export function openLoopbackBridge(deps, { streamId, path, onReady, onFrame, onC
   function dispose() {
     if (disposed) return;
     disposed = true;
+    clearTimeout(upgradeTimer);
+    upgradeTimer = null;
+    try { request?.destroy(); } catch { /* ignore */ }
+    request = null;
+    const sock = socket;
+    socket = null;
+    if (!sock) return;
     try {
-      socket?.end();
+      sock.end();
     } catch {
       /* ignore */
     }
-    socket = null;
+    /**
+     * ★ 优雅 end() 只发 FIN，若宿主侧迟迟不关（长连接服务、黑洞网络），这个 socket
+     *   会一直挂在 CLOSE_WAIT 且句柄不释放 —— 生产上表现为「手机早断了但连接器里
+     *   每条桥都留一个僵尸 socket」（每条隧道泄漏一个，长跑必积压），测试上表现为
+     *   进程永不退出。给 1s 宽限期后强制销毁；unref 保证兜底定时器本身不阻止退出。
+     */
+    const force = setTimeout(() => {
+      try { sock.destroy(); } catch { /* 已关 */ }
+    }, 1000);
+    force.unref?.();
   }
 
   return {
