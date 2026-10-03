@@ -15,7 +15,7 @@
  */
 
 /** 注入版本：写进 marker，便于真机 devtools 一眼确认层是否生效/为哪一版。 */
-export const SKIN_VERSION = '4';
+export const SKIN_VERSION = '5';
 
 /** 幂等标记：页面 HTML 中已含此串则跳过注入。 */
 export const SKIN_MARKER = '__DSH_KITE_MOBILE__';
@@ -38,7 +38,12 @@ const SKIN_CSS = [
   '[data-composer-seat] [data-model-compact] [data-composer-model],\n[data-composer-seat] [data-model-compact] [data-model-selector]{min-width:0;max-width:100%;}',
   '[data-composer-seat] [data-model-compact] button{min-width:0;max-width:100%;}',
   '[data-composer-seat] button{min-height:44px;}',
-  '[data-composer-seat] [aria-haspopup="menu"]{max-width:min(220px,calc(100vw - 112px));min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+  '[data-composer-seat] [aria-haspopup="menu"]{max-width:min(260px,calc(100vw - 112px));min-width:0;min-height:44px;padding-inline:8px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}',
+  /* ModelSelect portals escape data-composer-seat: constrain both root and model panes. */
+  'body > [role="menu"],body > [role="group"][aria-busy="true"],body > [role="group"][aria-busy="false"]{box-sizing:border-box;width:min(420px,calc(100vw - 24px));max-width:calc(100vw - 24px);max-height:min(68dvh,520px);overflow:auto;overscroll-behavior:contain;}',
+  'body > [role="menu"] button[role="menuitem"],body > [role="menu"] button[role="menuitemradio"],body > [role="group"] button[role="menuitem"],body > [role="group"] button[role="menuitemradio"]{box-sizing:border-box;width:100%;min-width:0;min-height:44px;max-width:100%;padding-block:8px;touch-action:manipulation;}',
+  'body > [role="menu"] [role="searchbox"],body > [role="group"] [role="searchbox"]{box-sizing:border-box;width:100%;min-width:0;min-height:44px;font-size:16px;}',
+  'body > [role="menu"] button[role="menuitem"] > *,body > [role="group"] button[role="menuitemradio"] > *{min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;}',
   /* Host InputBar row: first group owns the listbox add button, last group owns send. */
   '[data-composer-seat] div:has(> div:first-child > button[aria-haspopup="listbox"]):has(> div:last-child > button){flex-wrap:wrap;min-width:0;column-gap:8px;row-gap:8px;}',
   '[data-composer-seat] div:has(> div:first-child > button[aria-haspopup="listbox"]):has(> div:last-child > button) > :last-child{flex:1 1 0;min-width:0;margin-left:0;}',

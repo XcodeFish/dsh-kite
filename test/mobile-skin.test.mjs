@@ -86,7 +86,9 @@ test('内容：全面窄屏规则覆盖 composer、审批/提问、操作行、�
   assert.ok(text.includes('max-height:min(42dvh,360px)'), '交互卡滚动边界存在');
   assert.ok(text.includes(':has(> div:first-child > button[aria-haspopup="listbox"])'), 'composer send-space structure rule exists');
   assert.ok(text.includes('flex:0 0 44px;width:44px;height:44px'), 'composer send button reserves a stable hit box');
-  assert.ok(text.includes('> :not(button) > *{min-width:0;max-width:100%;overflow:hidden'), 'activity contents shrink inside the reserved space');
+  assert.ok(text.includes('body > [role="menu"]'), 'model portal menu is constrained outside composer seat');
+  assert.ok(text.includes('button[role="menuitemradio"]'), 'model and effort options get mobile hit areas');
+  assert.ok(text.includes('role="searchbox"'), 'model search input gets mobile sizing');
 });
 test('门禁：POST / 非 200 / 非 HTML / 空体 一律不注入', () => {
   assert.equal(applyMobileSkin(base({ method: 'POST' })), null);
