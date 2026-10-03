@@ -28,6 +28,56 @@ const RESPONSE_HEADER_WHITELIST = [
   'set-cookie'
 ];
 const MAX_RESPONSE_BYTES = 64 * 1024 * 1024; // PWA 资产 + 页面上限；超过回 502（可读）
+const LARGE_ASSET_STREAM_THRESHOLD = 256 * 1024;
+const STREAMABLE_ASSET_PATH = /^\/(?:assets|plugins)\//i;
+const COMPRESSIBLE_ASSET_TYPE = /^(?:text\/|application\/(?:javascript|json|xml)|image\/svg\+xml)/i;
+
+function acceptsGzip(value) {
+  const encodings = new Map();
+  for (const item of String(value ?? '').split(',')) {
+    const [name, ...params] = item.trim().toLowerCase().split(';');
+    if (!name) continue;
+    const q = params.map((part) => /^\s*q\s*=\s*([0-9.]+)\s*$/.exec(part))
+      .find(Boolean)?.[1];
+    encodings.set(name, q === undefined ? 1 : Number(q));
+  }
+  return (encodings.get('gzip') ?? encodings.get('*') ?? 0) > 0;
+}
+
+function appendVary(headers, value) {
+  const values = String(headers.vary ?? '').split(',').map((part) => part.trim()).filter(Boolean);
+  if (!values.some((part) => part.toLowerCase() === value.toLowerCase())) values.push(value);
+  return values.join(', ');
+}
+
+function streamLargeAsset({ method, pathname, status, headers, body, acceptEncoding }) {
+  if (method !== 'GET' || status !== 200 || !body || !STREAMABLE_ASSET_PATH.test(pathname)) return null;
+  const type = String(headers['content-type'] ?? '');
+  if (!COMPRESSIBLE_ASSET_TYPE.test(type)) return null;
+
+  const length = Number(headers['content-length']);
+  if (!Number.isSafeInteger(length) || length < LARGE_ASSET_STREAM_THRESHOLD || length > MAX_RESPONSE_BYTES) return null;
+
+  const shouldGzip = acceptsGzip(acceptEncoding) && !headers['content-encoding'];
+  if (shouldGzip && typeof CompressionStream !== 'function') return null;
+  let totalBytes = 0;
+  const limit = new TransformStream({
+    transform(chunk, controller) {
+      totalBytes += chunk.byteLength;
+      if (totalBytes > MAX_RESPONSE_BYTES) throw new Error(`response exceeded ${MAX_RESPONSE_BYTES}B`);
+      controller.enqueue(chunk);
+    }
+  });
+  let stream = body.pipeThrough(limit);
+  const outHeaders = { ...headers };
+  if (shouldGzip) {
+    stream = stream.pipeThrough(new CompressionStream('gzip'));
+    delete outHeaders['content-length'];
+    outHeaders['content-encoding'] = 'gzip';
+    outHeaders.vary = appendVary(outHeaders, 'Accept-Encoding');
+  }
+  return { headers: outHeaders, stream };
+}
 
 /**
  * ★ P0-4 来源标记头：连接器转发时无条件写入（值 = 进程级随机，见 index.js）。
@@ -75,7 +125,7 @@ export function filterResponseHeaders(rawHeaders) {
  * 单次 HTTP 转发。
  * deps: { credential: LoopbackCredential, policy: Policy, audit, logger }
  * logical: { deviceId, method, path, headers, body(Buffer|undefined), isDeviceValid:boolean }
- * 返回 { status, headers, body:Buffer, ViaPolicyDeny?:string }。
+ * 返回 { status, headers, body:Buffer }，或流式响应 { status, headers, stream:ReadableStream }。
  */
 export async function forwardRequest(deps, logical) {
   const { credential, policy, audit, logger, viaValue } = deps;
@@ -147,8 +197,7 @@ export async function forwardRequest(deps, logical) {
     //   SSE）等于「攒完再发」，长思考期间客户端零字节 → 超时断开 →
     //   raccoon: client has aborted request (HTTP 499)。真机事故 2026-10-01。
     const contentType = String(rawHeaders['content-type'] ?? '');
-    // 只在**明确声明 SSE** 时走流式；其余一律缓冲（内容寻址资源可压缩、可算 length，
-    // 且普通响应缓冲后语义更稳）。DSH 的 LLM 流与事件流都是 text/event-stream。
+    // SSE 和大静态模块走流式路径，其它响应默认缓冲（普通 JSON/API 可注入移动皮肤等改写）。
     const isStreaming = /text\/event-stream/i.test(contentType);
     if (isStreaming) {
       audit?.({ kind: 'proxy.forward-stream', deviceId: logical.deviceId, method, path: target.pathname, status: res.status });
@@ -159,6 +208,18 @@ export async function forwardRequest(deps, logical) {
       logger?.warn?.(`[kite] response too large (${declaredLength}B) for ${target.pathname}`);
       try { await res.body?.cancel?.(); } catch { /* ignore */ }
       return respond(502, { 'content-type': 'application/json' }, json({ error: 'proxy/response-too-large', message: '响应超过代理上限（64 MiB）' }));
+    }
+    const streamed = streamLargeAsset({
+      method,
+      pathname: target.pathname,
+      status: res.status,
+      headers,
+      body: res.body,
+      acceptEncoding: logical.headers?.['accept-encoding']
+    });
+    if (streamed) {
+      audit?.({ kind: 'proxy.forward-stream', deviceId: logical.deviceId, method, path: target.pathname, status: res.status });
+      return { status: res.status, headers: streamed.headers, stream: streamed.stream };
     }
     const buf = await readResponseBody(res, MAX_RESPONSE_BYTES);
     if (!buf) {

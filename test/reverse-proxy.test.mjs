@@ -7,6 +7,7 @@ import { AuditLog } from '../policy/audit.js';
 import { promises as fsp } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { gunzipSync } from 'node:zlib';
 
 function fakeCredential(base, cookie = 'dsh-auth-test=v1.a.b', hooks = {}) {
   return {
@@ -248,5 +249,89 @@ test('★流式响应：SSE 必须边收边转发（不得缓冲到结束）', a
     for (;;) { const { done, value } = await reader.read(); if (done) break; text += Buffer.from(value).toString('utf8'); }
     assert.match(text, /first/);
     assert.match(text, /second/);
+  } finally { server.close(); }
+});
+
+test('★ 大型插件模块边 gzip 边转发，首块先于上游完整下载到达', async () => {
+  const payload = Buffer.from(('export const value = "mobile-startup-module";\n').repeat(16_384).slice(0, 512 * 1024));
+  const { server, port } = await startLoopback((req, res) => {
+    res.writeHead(200, {
+      'content-type': 'application/javascript; charset=utf-8',
+      'content-length': String(payload.length),
+      'cache-control': 'public, max-age=31536000, immutable'
+    });
+    res.write(payload.subarray(0, 256 * 1024));
+    setTimeout(() => res.end(payload.subarray(256 * 1024)), 700);
+  });
+  try {
+    const deps = {
+      credential: fakeCredential(`http://127.0.0.1:${port}`),
+      policy: createPolicy({ remoteAgentPreset: 'default', allowedAgentPresets: ['default'] }),
+      audit: () => {},
+      logger: console
+    };
+    const startedAt = Date.now();
+    const result = await forwardRequest(deps, {
+      deviceId: 'd1',
+      method: 'GET',
+      path: '/plugins/??@deepseek-ai/client.js&rev=abc12345',
+      headers: { 'accept-encoding': 'gzip' },
+      isDeviceValid: true
+    });
+
+    assert.ok(result.stream, '大静态模块应返回流，而不是等待完整缓冲');
+    assert.ok(Date.now() - startedAt < 500, '代理应在上游响应尚未完成时返回');
+    assert.equal(result.headers['content-encoding'], 'gzip');
+    assert.equal(result.headers['content-length'], undefined, '流式压缩不得沿用原始长度');
+    assert.match(result.headers.vary, /Accept-Encoding/i);
+    assert.equal(result.headers['cache-control'], 'public, max-age=31536000, immutable');
+
+    const reader = result.stream.getReader();
+    const first = await reader.read();
+    assert.equal(first.done, false, '应收到首个压缩块');
+    assert.ok(Date.now() - startedAt < 600, '首块应在上游第二块到达前送出');
+    const chunks = [Buffer.from(first.value)];
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(Buffer.from(value));
+    }
+  } finally { server.close(); }
+});
+
+test('静态资源尊重 gzip;q=0，并保留原始长度', async () => {
+  const payload = Buffer.alloc(300 * 1024, 0x61);
+  const { server, port } = await startLoopback((_req, res) => {
+    res.writeHead(200, {
+      'content-type': 'application/javascript',
+      'content-length': String(payload.length)
+    });
+    res.end(payload);
+  });
+  try {
+    const result = await forwardRequest({
+      credential: fakeCredential(`http://127.0.0.1:${port}`),
+      policy: createPolicy({ remoteAgentPreset: 'default', allowedAgentPresets: ['default'] }),
+      audit: () => {},
+      logger: console
+    }, {
+      deviceId: 'd1',
+      method: 'GET',
+      path: '/assets/app.js',
+      headers: { 'accept-encoding': 'gzip;q=0, *;q=1' },
+      isDeviceValid: true
+    });
+
+    assert.ok(result.stream, '大资源仍应采用流式转发');
+    assert.equal(result.headers['content-encoding'], undefined, 'gzip;q=0 必须优先于通配符');
+    assert.equal(result.headers['content-length'], String(payload.length));
+    const reader = result.stream.getReader();
+    const chunks = [];
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(Buffer.from(value));
+    }
+    assert.deepEqual(Buffer.concat(chunks), payload);
   } finally { server.close(); }
 });
