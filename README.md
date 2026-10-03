@@ -99,6 +99,16 @@ systemctl show ra-relay -p ActiveEnterTimestamp    # 必须是「刚刚」——
 curl -s http://127.0.0.1:8787/healthz              # 服务器本机回环
 ```
 
+```bash
+# ★ 大响应完整性验收（2026-10-03 事故后新增；回环测不出，必须让消费端真的慢读）：
+#   期望：40/40 帧全部送达。旧码会在 32/40 处静默停住，且不产生任何错误帧。
+node --test test/relay-backpressure.test.mjs test/connector-backpressure.test.mjs
+```
+
+> **为什么这条验收必须存在**：本地回环永远瞬时排干发送缓冲，`write()` 恒返回 true，
+> 于是「大响应截断」这类 bug 在单测与桌面端**全绿**（它确实绿了整整一天）。
+> 只有让消费端**故意慢读**，背压路径才会被走到 —— 而手机经公网时，这事每时每刻都在发生。
+
 | 端点 | 用途 |
 |---|---|
 | `WSS /connector?c=<connectorId>` | Connector 出站接入（子协议 `ra-bearer.<token>` 鉴权） |
@@ -182,7 +192,7 @@ curl -s http://127.0.0.1:8787/healthz              # 服务器本机回环
 ## 9. 测试与探针
 
 ```bash
-npm test          # 183 项测试（帧/E2E/票据/设备存储/配对/策略/凭据/重建/审计/中继集成/入口模式/移动皮肤/安全回归/真机回归）
+npm test          # 194 项测试（帧/E2E/票据/设备存储/配对/策略/凭据/重建/审计/中继集成/入口模式/移动皮肤/安全回归/真机回归）
 npm run probe     # 离线宿主契约断言（DSH 升级后先跑这个）
 npm run verify    # 全链路：单测 + 面板 e2e + 配对流 + 全链 e2e + 浏览器模拟 + WS 复验
 node test/live-public-pair.verify.mjs   # 线上验收：真实走一遍公网配对 + 资源路由检查
@@ -197,7 +207,8 @@ node test/live-public-pair.verify.mjs   # 线上验收：真实走一遍公网�
 - 配对完成后连接器必须自发上报设备表（白屏 / Failed to load plugins 事故）；
 - 路由条目不随手机 socket 断开消失（连接不稳定事故）；
 - 未认证 `?d=` 不得改写已发布设备的路由（路由劫持，探针 `route-hijack.probe.mjs` 复现 → 加固后未复现）；
-- Pair-Proof：合法 claim 绑定归属 / 伪造 claim 拒绝 / claim 绑定 connectorId 防重放换主。
+- Pair-Proof：合法 claim 绑定归属 / 伪造 claim 拒绝 / claim 绑定 connectorId 防重放换主；
+- **大响应背压不截断**（`test/relay-backpressure.test.mjs` + `test/connector-backpressure.test.mjs`，2026-10-03 白屏事故）：中继侧 `res.write()===false` 必须完整送达、连接器侧同步循环必须等 `drain`；两个测试都刻意用「慢读」制造背压 —— 回环全速读取**不会**触发，这正是该 bug 长期漏测的原因。
 
 在宿主内的三假设探针：管理面板 → 「运行探针」，期望 `overall:"ok"`。任何 failed → 先查「浏览器访问」是否开启（最常见的 403 来源）。
 
@@ -208,6 +219,7 @@ node test/live-public-pair.verify.mjs   # 线上验收：真实走一遍公网�
 | 面板/代理全部 403 `Browser access is disabled` | 开「浏览器访问」（§1） |
 | 手机白屏（骨架在、资源 401） | 设备不在中继路由表。升级到 ≥ 524c989 并重启 DSH（§0 路由语义） |
 | 「Failed to load plugins · HTML did not preload」 | 同上 —— 连接器未在配对成功后上报设备表 |
+| **手机白屏 + 「Failed to load plugins」+ `import failed`，而桌面打开同 URL 一切正常** | **大响应被截断**（2026-10-03 双根因，见 §13）。桌面走回环不触发，只有手机经公网会中招。需**中继与连接器同时升级**（重启 DSH） |
 | 手机 503「中继未就绪」 | connector 不在线：看面板 relay 状态；核对 relayUrl/relayToken |
 | 实时数据不更新、越用越卡 | 老版本中继的 WS 路由 bug（c38cf6e 前）。升级中继 |
 | 改了代码没生效 | 重启 DSH（宿主只在启动时加载插件模块） |
@@ -229,7 +241,7 @@ admin/                管理面板 + 手机配对页 + kill switch
                       ├─ sidebar-entry.js  左侧栏条目（dsh.client web 半包，sidebar.footer.action 槽）
                       └─ panel-client.js   面板引擎（浮层 + 认证；暴露 window.__DSH_KITE_OPEN__ 供侧栏调用）
 relay/                独立中继（唯一允许依赖 ws：server.mjs + deploy/ 一键部署包）
-test/                 183 项测试 + 离线宿主探针 + 线上验收脚本 + 真机 Chrome e2e（入口模式 / 配对）
+test/                 194 项测试 + 离线宿主探针 + 线上验收脚本 + 真机 Chrome e2e（入口模式 / 配对）
 ```
 
 ## 12. 与设计方案的有意偏差（ADR 补记）
@@ -238,3 +250,47 @@ test/                 183 项测试 + 离线宿主探针 + 线上验收脚本 + 
 2. **PWA 模式下 E2E 不生效**：M0 客户端是未改造的上游 PWA，物理上无法实现 sealed 帧；该模式下中继 TLS 即边界。
 3. **审批不注册应答者**：`dsh-api-remotes` 已把审批请求转发给全部远程客户端，插件抢答会制造双确认歧义。落地：旁听审计 + 依赖 PWA 应答。
 4. **Bearer 令牌走子协议而非 headers**：Node 全局 WebSocket 不支持自定义头；令牌经 `Sec-WebSocket-Protocol: ra-bearer.<token>`，不落 URL 日志。
+
+## 13. 事故档案：大响应截断（2026-10-03）
+
+**症状**：手机端白屏并报 `Failed to load plugins` / `import failed`；**桌面端打开同一 URL 完全正常**。
+
+**根因（两处，同一类错的两次独立犯案 —— 缺一不可地同时修复）**：
+
+| # | 位置 | 错误写法 | 后果 |
+|---|---|---|---|
+| ① | `relay/server.mjs` 响应回传 | 把 `res.write(chunk) === false`（**正常的 TCP 背压信号**）当成致命错误 → `res.destroy()` | 头已发出（`200` + `content-length: N`），body 只写一半 → 浏览器判定响应不完整 |
+| ② | `transport/relay-client.js` `#sendHttpResponse` | 在**同步 for 循环**里一次性把整个 body 塞进 ws | 10 MB 合并包 = 40 帧 × 341 KB ≈ 13.3 MB 连续入队，同步循环期间事件循环无法推进，`bufferedAmount` 顶穿 8 MB 上限 → `send()` 返回 false → **静默 return**：实测只发出 **32/40 帧**，20% 数据丢失且**无任何错误帧** |
+
+**为什么只有手机中招、且长期漏过测试**：这两条路径都只在「消费端读取变慢」时才触发。
+桌面端走 `127.0.0.1` 回环，内核瞬时排干，`write()` 永远返回 true；本地单测同样是回环 ——
+**测试环境的物理特性恰好把 bug 遮住了**。手机经公网 + Caddy + TLS，接收窗口必然在传输
+大包的某一刻填满，背压不可避免。
+
+**现场证据**（`~/.dsh/plugin-data/dsh-kite/default/audit.jsonl`）：06:25 时间窗内，
+两个最大的合并包（`5492860 B` 与 `10461917 B`）被**反复重试 9 次 / 13 次** —— 正是浏览器
+「资源没下全 → 重试 → 又没下全」的症状。
+
+**修复与验收**：
+
+```bash
+# 单测（含两个新回归测试，均在旧码上验证过会红）
+node --test test/*.test.mjs                     # 194/194
+
+# 复现矩阵：生产实测尺寸 × 600ms 慢读
+#   旧码 完整 0/3   收到 [0, 0, 0] 字节
+#   新码 完整 3/3   收到 [5492860, 5492860, 5492860]
+```
+
+**新增可观测面**（`/healthz` 与 `/metrics`）：
+
+| 指标 | 含义 |
+|---|---|
+| `httpBackpressure` / `ra_relay_http_backpressure_total` | 背压发生次数。**它是正常现象** —— 持续增长且客户端不再报错，就说明修复生效 |
+| `httpPendingPeak` / `ra_relay_http_pending_peak_bytes` | 单流未排空字节峰值。用于确认「不断开」没有退化成无界内存 |
+| `ra_relay_stream_pending_limit_bytes` | 护栏上限（默认 32 MiB，`RELAY_MAX_STREAM_PENDING_BYTES` 可调）。**只有**超过它才判定对端真死并断开 |
+
+**教训（写进纪律）**：`write()` / `send()` 返回 `false` 是**背压**，不是**错误**。
+正确的反应是「等 `drain` 再继续」；若最终确实发不出去，必须**显式回报错误帧** ——
+静默 `return` 让失败在两端都不可见，是最贵的写法。
+

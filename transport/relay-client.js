@@ -612,7 +612,9 @@ export class RelayConnector {
             }
             this.publishDevices();
           }
-          this.#sendHttpResponse(stream.deviceId, streamId, res, stream);
+          // ★ 必须 await：streams.delete 若在发送完成前执行，#awaitSendCapacity 的
+          //   #canSendStream 守卫会立刻判定「流已取消」而提前中止（2026-10-03）。
+          await this.#sendHttpResponse(stream.deviceId, streamId, res, stream);
           this.#streams.delete(streamId);
           return;
         }
@@ -627,7 +629,9 @@ export class RelayConnector {
         isDeviceValid: Boolean(deviceId),
         signal: stream.abortController?.signal
       });
-      this.#sendHttpResponse(stream.deviceId, streamId, result, stream);
+      // ★ 同上：await 之后再删流。注意流式响应（result.stream）走 #sendHttpStream
+      //   自己管理生命周期，这里仅在非流式时删。
+      await this.#sendHttpResponse(stream.deviceId, streamId, result, stream);
       if (!result.stream) this.#streams.delete(streamId);
     } catch (error) {
       this.#streams.delete(streamId);
@@ -672,7 +676,25 @@ export class RelayConnector {
         for (let offset = 0; offset < value.length; offset += MAX_CHUNK_BYTES) {
           const chunk = value.subarray(offset, offset + MAX_CHUNK_BYTES);
           const last = offset + MAX_CHUNK_BYTES >= value.length;
-          if (!this.send({ kind: 'http-res-body', deviceId, streamId, chunk: b64e(chunk), final: false })) return;
+          // ★ 同样的背压纪律（2026-10-03）：SSE 长流虽然单帧小，但高频 assistant 流
+          //   在慢链路下同样会把 bufferedAmount 顶穿上限 —— 旧代码在这里静默 return，
+          //   客户端看到的是「流戛然而止」。先等容量，失败则显式回报。
+          if (!(await this.#awaitSendCapacity(streamId, stream))) return;
+          if (!this.send({ kind: 'http-res-body', deviceId, streamId, chunk: b64e(chunk), final: false })) {
+            this.#recordDrop('stream_body_send_failed', { streamId, offset });
+            if (!signal?.aborted) {
+              this.send({
+                kind: 'http-error',
+                deviceId,
+                streamId,
+                code: 'proxy/stream-truncated',
+                status: 502,
+                message: '流式响应发送中断（连接器发送缓冲无法排空）'
+              });
+            }
+            this.#streams.delete(streamId);
+            return;
+          }
           if (!last) continue;
         }
       }
@@ -692,7 +714,16 @@ export class RelayConnector {
     }
   }
 
-  #sendHttpResponse(deviceId, streamId, res, stream) {
+  /**
+   * 响应回传（缓冲路径）。★ 自 2026-10-03 起本方法是 **async**：大响应必须
+   * 逐帧等待发送缓冲排空（见 #awaitSendCapacity 的说明），否则 10MB 合并包会在
+   * 同步循环里顶穿 8MB 发送上限并静默截断。
+   *
+   * 调用契约：两个调用点都在 #handleHttp 的 try/catch 内，因此**必须 await** ——
+   * 既为了让流在发送期间保持存活（否则守卫误判「已取消」），也为了让发送期的
+   * 异常落进同一个 catch，而不是变成游离的 unhandled rejection。
+   */
+  async #sendHttpResponse(deviceId, streamId, res, stream) {
     // 流式响应走专用路径（不缓冲）
     if (res.stream) {
       void this.#sendHttpStream(deviceId, streamId, res, stream);
@@ -722,12 +753,67 @@ export class RelayConnector {
       }
     }
     this.send({ kind: 'http-res-head', deviceId, streamId, status: res.status, headers });
+    /**
+     * ★★ P0（2026-10-03 真机事故，与中继侧 write()===false 是**同一类错的第二处**）：
+     *   旧实现在**同步 for 循环**里一次性把整个 body 塞进 ws —— 对 10MB 的合并客户端
+     *   模块包就是 40 帧 × 341KB = 13.3MB 连续入队。同步循环期间事件循环无法推进，
+     *   `bufferedAmount` 只增不减，必然越过 MAX_SEND_BUFFER_BYTES(8MB) →
+     *   send() 返回 false → `return` **静默中断**：已发出约 5.8MB，剩下的 42% 永不发送，
+     *   而且**连一个 http-error 都没回**。中继那边看到的就是「响应不完整」。
+     *
+     *   修法两层，缺一不可：
+     *   ① 等待排空再继续（drain 语义）：让事件循环有机会把缓冲写进链路；
+     *   ② 真排不空（对端死亡）时**显式回错误帧**，绝不静默 return。
+     */
     for (let offset = 0; offset < body.length || offset === 0; offset += MAX_CHUNK_BYTES) {
       const chunk = body.subarray(offset, offset + MAX_CHUNK_BYTES);
       const final = offset + MAX_CHUNK_BYTES >= body.length;
-      if (!this.send({ kind: 'http-res-body', deviceId, streamId, chunk: b64e(chunk), final })) return;
+      // ① 先等缓冲回落（含首次进入）：避免同步循环把 bufferedAmount 顶穿上限。
+      if (!(await this.#awaitSendCapacity(streamId, stream))) return;
+      if (!this.send({ kind: 'http-res-body', deviceId, streamId, chunk: b64e(chunk), final })) {
+        // ② 已经到了该发却仍然发不出去 —— 必须显式告知，不能静默截断。
+        this.#deps.logger?.warn?.(`[kite] http-res-body 发送失败（缓冲区满/连接关闭），显式回报错误 streamId=${streamId}`);
+        this.#recordDrop('response_body_send_failed', { streamId, offset, total: body.length });
+        this.send({
+          kind: 'http-error',
+          deviceId,
+          streamId,
+          code: 'proxy/response-truncated',
+          status: 502,
+          message: '响应体发送中断（连接器发送缓冲无法排空）'
+        });
+        return;
+      }
       if (final) break;
     }
+  }
+
+  /**
+   * 等待 ws 发送缓冲回落到安全水位（背压的 drain 语义）。
+   *
+   * 为什么不能只靠 send() 的失败检查：同步循环里 bufferedAmount 单调上升，
+   * 等失败才反应已经晚了（数据早丢）。这里在**每帧之前**让出事件循环，
+   * 使 undici 有机会把缓冲写进内核 —— 这是「10MB 响应不截断」的关键。
+   *
+   * @returns true = 可以继续发送；false = 流已被取消/连接已换，应中止且不再回报。
+   */
+  async #awaitSendCapacity(streamId, stream) {
+    const LOW_WATERMARK = MAX_SEND_BUFFER_BYTES / 2;
+    // 最多等 30 秒（对端彻底不消费的场景），超时即放弃并回报错误 —— 有界，不挂死。
+    const deadline = Date.now() + 30_000;
+    while (Number(this.#ws?.bufferedAmount ?? 0) > LOW_WATERMARK) {
+      if (!this.#canSendStream(streamId, stream)) return false;
+      if (Date.now() > deadline) {
+        this.#recordDrop('send_capacity_timeout', {
+          streamId,
+          bufferedAmount: Number(this.#ws?.bufferedAmount ?? 0),
+          limit: MAX_SEND_BUFFER_BYTES
+        });
+        return true; // 让调用方走 send() 失败的显式错误分支
+      }
+      await new Promise((resolve) => setTimeout(resolve, 4));
+    }
+    return this.#canSendStream(streamId, stream);
   }
 
   // ---- 配对（thin client 帧流；PWA 页面共用 pairing service）----

@@ -157,6 +157,20 @@ const MAX_BODY_BYTES = 8 * 1024 * 1024;
 const MAX_PHONE_BUFFER_BYTES = 8 * 1024 * 1024;
 /** WebSocket 发送缓冲上限（连接器/手机任一侧超限即拒发，避免静默丢帧）。 */
 const MAX_SOCKET_BUFFER_BYTES = 8 * 1024 * 1024;
+/**
+ * ★ 单条 HTTP 响应流的「未排空字节」上限（2026-10-03）。
+ *
+ * 为什么需要它：`res.write() === false` 是正常背压，修好之后**不再**断开连接 ——
+ * 但「忽略背压」绝不能等于「允许无界积压」：若手机真的停止消费（拔网线、进程挂死），
+ * Node 内部缓冲会一直涨。所以给出一个明确的护栏：
+ *   pendingBytes（本流尚未排空字节）超过本上限 → 判定对端实质停摆，才断开该流。
+ *
+ * 取值依据：DSH 首屏最大的合并客户端模块包实测 10.0 MB（10461917 B），
+ * 手机在正常移动网络下每次窗口填满只积压几百 KB 量级；32 MiB 给了 3 倍余量，
+ * 既不会在正常慢速链路上误杀，又能在对端真死时把内存钉死。
+ */
+const MAX_STREAM_PENDING_BYTES = Number(process.env.RELAY_MAX_STREAM_PENDING_BYTES) > 0
+  ? Number(process.env.RELAY_MAX_STREAM_PENDING_BYTES) : 32 * 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 110_000; // 高于 Cloudflare 524 阈值（100s），保证我们能先给出明确错误而非 CF 超时页
 const RESPONSE_IDLE_TIMEOUT_MS = Number(process.env.RELAY_RESPONSE_IDLE_TIMEOUT_MS) >= 1000
   ? Number(process.env.RELAY_RESPONSE_IDLE_TIMEOUT_MS) : 120_000;
@@ -190,6 +204,20 @@ const RATE_MAX_TRACKED_KEYS = 20_000;
 const metrics = {
   connectorConnects: 0, phoneConnects: 0, httpRequests: 0, wsBridges: 0, rejected: 0,
   bytesRelayed: 0, startedAt: Date.now(),
+  /**
+   * ★ 响应体背压发生次数（2026-10-03）。
+   *   定义：某次 `res.write(chunk)` 返回 false —— 即手机侧接收窗口满过一次。
+   *   它**不是错误**，而是「大响应 + 移动网络」必然出现的信号。此前该分支被误当
+   *   致命错误 destroy()，导致大包被拦腰截断。这个计数存在的意义是：把它变成
+   *   可观测的常态指标 —— 数字持续增长而响应完整，就是系统在正常工作。
+   */
+  httpBackpressure: 0,
+  /**
+   * ★ 响应体待排空字节的峰值（背压深度）。
+   *   上限护栏：单条流未排空字节超过 MAX_STREAM_PENDING_BYTES 时，判定对端
+   *   （手机）已实质停止消费 —— 此时才允许断开，避免「背压」变成无界内存。
+   */
+  httpPendingPeak: 0,
   // ---- 丢帧观测（P0，2026-10-01）------------------------------------------------
   // 动因：客户端报「session assistant stream skipped revision N」时，服务器侧零证据 ——
   // 因为下面这些丢帧/断连路径以前全是静默的：
@@ -574,7 +602,10 @@ function handleHealth(res) {
     frameLimitBytes: MAX_FRAME_BYTES,
     // 入口防护计数：限流拒绝按桶计数 + /metrics 未授权访问次数（都是数字，无敏感值）。
     rateLimitedByBucket,
-    metricsDenied: metrics.metricsDenied
+    metricsDenied: metrics.metricsDenied,
+    // 响应体背压：发生次数（正常现象）与未排空峰值（内存护栏视角）。
+    httpBackpressure: metrics.httpBackpressure,
+    httpPendingPeak: metrics.httpPendingPeak
   }));
 }
 
@@ -593,6 +624,15 @@ function handleMetrics(res) {
     '# TYPE ra_relay_largest_frame_bytes gauge',
     `ra_relay_largest_frame_bytes ${metrics.largestFrameBytes}`,
     '# TYPE ra_relay_frame_limit_bytes gauge', `ra_relay_frame_limit_bytes ${MAX_FRAME_BYTES}`,
+    // ---- 响应体背压（2026-10-03）----
+    // 语义：http_backpressure_total 是**正常**的 TCP 背压发生次数（越大只说明流量大），
+    // 它持续增长而客户端不再报「Failed to load plugins」，正是修复生效的证据。
+    '# TYPE ra_relay_http_backpressure_total counter',
+    `ra_relay_http_backpressure_total ${metrics.httpBackpressure}`,
+    '# TYPE ra_relay_http_pending_peak_bytes gauge',
+    `ra_relay_http_pending_peak_bytes ${metrics.httpPendingPeak}`,
+    '# TYPE ra_relay_stream_pending_limit_bytes gauge',
+    `ra_relay_stream_pending_limit_bytes ${MAX_STREAM_PENDING_BYTES}`,
     '# TYPE ra_relay_wire_frame_limit_bytes gauge', `ra_relay_wire_frame_limit_bytes ${MAX_WIRE_FRAME_BYTES}`,
     // 带 label 的两个家族：TYPE 行必须**只出现一次**，不能跟着样本一起循环发
     // （重复 TYPE 行不是合法 Prometheus 文本；初版就是循环里发的，已由测试反证）。
@@ -826,6 +866,12 @@ function handlePhoneHttp(req, res) {
   req.on('end', () => {
     if (aborted || settled) return;
     const body = Buffer.concat(chunks);
+    /**
+     * 本流尚未排空的字节数（背压深度）。排空进度由 `res.writableLength` 反映：
+     * 它会在 Node 把缓冲写进内核后自然回落。这里不做定时轮询 —— 只在**发生背压
+     * 的那一次 write** 之后用它判护栏，成本为零。
+     */
+    let pendingBytes = 0;
     streams.set(streamId, {
       res,
       connectorId: streamConnectorId,
@@ -835,6 +881,8 @@ function handlePhoneHttp(req, res) {
       get bodyTimer() { return bodyTimer; },
       get headersSent() { return headersSent; },
       set headersSent(value) { headersSent = value; },
+      get pendingBytes() { return pendingBytes; },
+      set pendingBytes(value) { pendingBytes = value; },
       onHeaders: () => { headersSent = true; clearTimeout(timer); resetBodyTimer(); },
       onBody: () => resetBodyTimer(),
       onDone: () => { settled = true; clearStreamTimers(); streams.delete(streamId); }
@@ -1063,9 +1111,51 @@ function relayConnectorFrame(connectorWs, frame) {
         stream.onDone?.();
       } else {
         stream.onBody?.();
-        if (stream.res.write(chunk) === false) {
-          stream.res.destroy();
-          streams.delete(frame.streamId);
+        /**
+         * ★★ P0 铁律（2026-10-03 真机事故）：`res.write()` 返回 false 是**正常的 TCP
+         *   背压信号**，不是错误 —— 它只表示「内核发送缓冲已满，等 'drain' 事件再写」。
+         *   Node 会自己在内部把这次 write 的数据排队排干，调用方**什么都不用做**。
+         *
+         *   旧实现把它当致命错误 → `res.destroy()`：响应被**拦腰掐断**。而中继是
+         *   「先 writeHead 再分片 write」的流式回传，销毁时头已经发出去（HTTP/1.1 200 +
+         *   content-length: N），body 却只写了一半 —— 浏览器侧看到的是响应**不完整**：
+         *   Content-Length 与实收字节不符 → 该资源解析失败。对合并客户端模块包
+         *   （/plugins/??…/client.js，实测 5.2MB / 10.0MB 两个批次）就表现为
+         *   「Failed to load plugins … import failed」。
+         *
+         *   为什么只在真机、只在最近才爆：手机经公网 + Caddy + TLS 下行，接收窗口一定会
+         *   在传输大包的某一刻填满 → 背压不可避免；而 ≥5MB 的合并包每次首屏要拉 2 个
+         *   （10-03 06:25 窗口 audit 里同一 URL 被重复请求 18 次即此症状）。本地回环
+         *   （Mac → 127.0.0.1）瞬时排干，永远不触发，所以单测与本地验证全绿。
+         *
+         *   修法：不加任何干预（正确姿势就是忽略返回值）；仅记一次可观测事件，
+         *   让「背压发生过、但响应完整送达」这件事在 metrics 里看得见。
+         */
+        const flushed = stream.res.write(chunk);
+        if (flushed === false) {
+          metrics.httpBackpressure += 1;
+          // 用 writableLength 判「对端是不是真的停摆了」：正常慢速链路上它会随内核
+          // 排空自然回落，只有对端彻底不消费时才会持续堆高。护栏失败才允许断开 ——
+          // 这才是「背压」与「死连接」的正确区分（旧代码把两者混为一谈）。
+          const pending = Number(stream.res.writableLength ?? 0);
+          stream.pendingBytes = pending;
+          if (pending > metrics.httpPendingPeak) metrics.httpPendingPeak = pending;
+          if (pending > MAX_STREAM_PENDING_BYTES) {
+            recordDrop('response_pending_overflow', {
+              streamId: frame.streamId,
+              pending,
+              limit: MAX_STREAM_PENDING_BYTES,
+              path: stream.resourceUrl ?? null
+            });
+            stream.res.destroy();
+            streams.delete(frame.streamId);
+            return;
+          }
+          // 显式声明：我们依赖 'drain' 而不是 destroy。挂空监听同时表明意图，
+          // 并让 Node 保持对该响应的排空调度。
+          stream.res.once('drain', () => {
+            stream.pendingBytes = 0;
+          });
         }
       }
       return;
