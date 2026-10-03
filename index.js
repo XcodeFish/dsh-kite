@@ -352,6 +352,8 @@ export function apply(ctx, config) {
       pairing: {
         begin: (...args) => live.pairing.begin(...args),
         list: (...args) => live.pairing.list(...args),
+        // 最近一次配对结局（成功/失败/过期）：面板把「等待手机提交…」换成确定终态的依据。
+        last: (...args) => live.pairing.last(...args),
         abortAll: (...args) => live.pairing.abortAll(...args)
       },
       audit,

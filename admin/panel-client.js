@@ -289,11 +289,14 @@
       var codeLabel = h('div', NOTE, '手机提交后，这里显示桌面侧校验码（与手机比对一致再确认）：');
       codeLabel.style.marginTop = '10px';
       var codeEl = h('div', 'font:700 26px/1.3 ui-monospace,Menlo,monospace;letter-spacing:.18em;color:#7ee2b8;min-height:2rem;', '等待手机提交…');
+      // 配对终态横幅：成功/失败/过期在这里落定 —— 光靠码位本身说不出「成了没有」。
+      var pairBanner = h('div', 'display:none;margin-top:10px;border-radius:8px;padding:9px 11px;font:12px/1.6 system-ui,-apple-system,sans-serif;');
       pairInfo.appendChild(pairHint);
       pairInfo.appendChild(linkRow);
       pairInfo.appendChild(countdown);
       pairInfo.appendChild(codeLabel);
       pairInfo.appendChild(codeEl);
+      pairInfo.appendChild(pairBanner);
       pairFlex.appendChild(qrBox);
       pairFlex.appendChild(pairInfo);
       pairOut.appendChild(pairFlex);
@@ -365,11 +368,118 @@
 
       var timer = null;
       var pending = null;
+      // 本次面板发起的配对：{ tokenMasked } —— 用来认领服务端返回的终态，
+      // 别人拿旧二维码扫出的结局不会污染这个面板（见 pairingLast 的归属判断）。
+      var pairWatch = null;
+      // 成功态自动折叠的定时器句柄。必须持有并显式清除：
+      // ① 本体每 1.5/5 秒轮询一次，无条件重挂 setTimeout 会让折叠永不触发（成功态赖着不走）；
+      // ② 用户折叠前又点了一次「生成配对二维码」时，上一轮的折叠定时器必须撤掉 ——
+      //    否则它会在新配对进行中把二维码区藏掉（真机复现：失败提示刚出就被藏）。
+      var pairHideTimer = null;
+      function cancelPairHide() {
+        if (pairHideTimer) { clearTimeout(pairHideTimer); pairHideTimer = null; }
+      }
 
       function showError(e) {
         state.textContent = '出错：' + (e && e.message ? e.message : e);
         state.style.color = '#f85149';
       }
+
+      /** 终态提示条。tone: 'ok' | 'bad' | 'warn'。 */
+      function showBanner(tone, html) {
+        var skin = {
+          ok: 'border:1px solid #1f6f4a;background:#0f2a1e;color:#7ee2b8;',
+          bad: 'border:1px solid #7a2a2a;background:#2a1416;color:#f85149;',
+          warn: 'border:1px solid #7a5a1a;background:#241a05;color:#e3b341;'
+        };
+        pairBanner.style.cssText = 'display:block;margin-top:10px;border-radius:8px;padding:9px 11px;font:12px/1.6 system-ui,-apple-system,sans-serif;' + (skin[tone] || skin.warn);
+        pairBanner.innerHTML = html;
+      }
+
+      /**
+       * 配对终态渲染 —— 面板不再显示「等待手机提交…」的第二种含义。
+       *
+       * ★ 真机事故 2026-10-03（用户截图）：扫码成功、设备已进「已配对设备」表，
+       *   红框里却仍是「等待手机提交…」。根因是**没有终态来源**：配对成功那一刻
+       *   pairing.complete() 就把会话从 pending 删掉了，面板每轮只能看到「条目消失」，
+       *   而「成功 / 验签失败 / 二维码过期 / kill switch 清空」在 list() 里长得一模一样。
+       *   原来只有独立页 /kite 有个基于时间窗的启发式（window.__pairWatch），
+       *   注入式浮层（本文件）连那个都没有 → 永远停在初始文案。
+       *   现在服务端直接给终态（status.pairingLast），两端同源、无启发式。
+       */
+      function renderPairOutcome(s) {
+        var last = s.pairingLast;
+        var list = s.pairings || [];
+        var coded = null;
+        for (var i = 0; i < list.length; i += 1) { if (list[i].code) { coded = list[i]; break; } }
+
+        if (coded) {
+          // 进行中：手机已提交公钥，出示桌面侧校验码供两端比对。
+          codeEl.textContent = coded.code;
+          codeEl.style.color = '#7ee2b8';
+          codeLabel.textContent = '手机已提交公钥。请与手机上的 6 位码比对，一致再在手机上点确认：';
+          pairBanner.style.display = 'none';
+          return;
+        }
+
+        if (list.length > 0) {
+          // 进行中：等手机提交公钥。
+          codeEl.textContent = '等待手机提交…';
+          codeEl.style.color = '#7ee2b8';
+          codeLabel.textContent = '手机提交后，这里显示桌面侧校验码（与手机比对一致再确认）：';
+          pairBanner.style.display = 'none';
+          return;
+        }
+
+        // 没有进行中的会话 —— 看终态。
+        if (!pairWatch) return; // 本次面板没发起过配对（例如刚打开面板）：保持原样，别乱报
+        if (!last) {
+          // 会话没了、服务端也没有任何终态：唯一可疑情况是**服务端重启**（面板是刚被重新
+          // 注入的，但服务端 pending 已清空）。这时二维码多半已失效，让用户重来而不是干等。
+          // 注意不能靠 at 时间戳判断 —— 重启后 at 会归零，反而更小。
+          codeEl.textContent = '—';
+          codeEl.style.color = '#8b949e';
+          showBanner('warn', '配对会话已失效（服务可能刚重启过）。二维码已作废，请重新点「生成配对二维码」。');
+          return;
+        }
+        if (!last.tokenMasks || last.tokenMasks.indexOf(pairWatch.tokenMasked) === -1) {
+          // 这条终态属于**别人**的配对（另一个面板，或有人拿旧二维码在扫）：
+          // 与本面板无关，保持现有显示不动 —— 误报「已失效 / 已成功」都比多等一轮更糟。
+          return;
+        }
+
+        if (last.ok) {
+          codeEl.textContent = '✓ 配对成功';
+          codeEl.style.color = '#4ade80';
+          codeLabel.textContent = '设备已加入下方「已配对设备」表';
+          showBanner('ok', '设「' + esc2(last.name || 'device') + '」已加入 · 配对完成，手机正在进入 DSH。');
+          // 3 秒后自动折叠二维码区，避免占屏（与独立页 /kite 同一节奏）。
+          // ★ 必须只挂一次：本函数每 1.5/5 秒被调用一次，无条件 setTimeout 会不断续命，
+          //   折叠永远不触发（真机表现为成功态赖着不走）。
+          if (!pairHideTimer && pairOut.style.display !== 'none') {
+            pairHideTimer = setTimeout(function () {
+              pairHideTimer = null;
+              try { pairOut.style.display = 'none'; } catch (e) { /* 面板已关 */ }
+              pairWatch = null;
+            }, 3000);
+          }
+          return;
+        }
+
+        var reasonText = {
+          expired: '二维码已过期（120 秒未完成）。请重新生成。',
+          rejected: '挑战验签失败' + (last.detail ? '：' + esc2(last.detail) : '') + '。请重新生成二维码再扫。',
+          reused: '该二维码已被使用过（一次性）。请重新生成。',
+          'invalid-pubkey': '手机提交的公钥格式非法。请重新生成二维码再扫。',
+          aborted: '配对已被中止（紧急停用 kill switch）。请先解除停用。',
+          unknown: '配对令牌无效或已过期。请重新生成二维码。'
+        }[last.reason] || '配对未完成。请重新生成二维码。';
+        codeEl.textContent = '✗ 未完成';
+        codeEl.style.color = '#f85149';
+        showBanner('bad', reasonText);
+      }
+
+      function esc2(v) { return String(v == null ? '' : v).replace(/[&<>"']/g, function (c) { return ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]; }); }
 
       function renderStatus(s) {
         state.style.color = '#8b949e';
@@ -417,13 +527,10 @@
             tbody.appendChild(tr);
           });
         }
-        // 待配对：桌面侧校验码
-        var list = s.pairings || [];
-        if (list.length > 0) {
-          var coded = null;
-          for (var i = 0; i < list.length; i += 1) { if (list[i].code) { coded = list[i]; break; } }
-          codeEl.textContent = coded ? coded.code : '等待手机提交…';
-        }
+        // 配对区：进行中会话 + 终态（成功/失败/过期）统一渲染。
+        // ★ 旧码在这里只有 `if (list.length > 0)` 一个分支 —— 会话一消失就什么都不做，
+        //   于是「等待手机提交…」永驻（真机事故 2026-10-03，用户截图红框）。
+        renderPairOutcome(s);
         auditPre.textContent = (s.audit || []).map(function (e2) {
           return new Date(e2.ts).toLocaleTimeString() + ' ' + (e2.kind || '') + (e2.deviceId ? ' ' + e2.deviceId : '') + (e2.reason ? ' — ' + e2.reason : '') + (e2.path ? ' ' + e2.path : '');
         }).join('\n') || '（暂无事件）';
@@ -462,6 +569,14 @@
               qrBox.appendChild(h('div', 'width:174px;padding:8px;color:#0e1116;font:12px/1.5 system-ui,sans-serif;', d.note || '未配置中继，无法生成二维码'));
             }
             codeEl.textContent = '等待手机提交…';
+            codeEl.style.color = '#7ee2b8';
+            codeLabel.textContent = '手机提交后，这里显示桌面侧校验码（与手机比对一致再确认）：';
+            pairBanner.style.display = 'none';
+            // ★ 认领本次配对的终态：tokenMasked 由服务端给（与 /status 的 pairingLast 同一格式），
+            //   面板据此判断「那条结局是不是我这次发起的」。
+            pairWatch = d.tokenMasked ? { tokenMasked: d.tokenMasked } : null;
+            // 上一轮成功态的折叠定时器必须撤掉，否则它会在新配对进行中把二维码区藏掉。
+            cancelPairHide();
             var left = Math.max(0, Math.round((d.expiresAt - Date.now()) / 1000));
             countdown.textContent = left > 0 ? left + 's 后过期' : '已过期，请重新生成';
             var t = setInterval(function () {
@@ -476,10 +591,17 @@
       }
 
       load();
-      timer = setInterval(function () {
+      // ★ 自适应轮询：配对区展开时 1.5 秒一轮 —— 用户就盯着那个红框看，
+      //   5 秒的节奏在「扫码 → 出码」之间会有肉眼可见的空白期。
+      //   平时（无配对）退回 5 秒，别为一块静态面板多打接口。
+      var tick = function () {
         if (!document.getElementById(OVERLAY_ID)) { clearInterval(timer); return; }
         load();
-      }, 5000);
+        var want = pairOut.style.display === 'block' ? 1500 : 5000;
+        if (want !== intervalMs) { intervalMs = want; clearInterval(timer); timer = setInterval(tick, intervalMs); }
+      };
+      var intervalMs = 5000;
+      timer = setInterval(tick, intervalMs);
     }
 
     function makeButton() {

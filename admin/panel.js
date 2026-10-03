@@ -309,6 +309,10 @@ export function createAdminHandler(deps) {
           relayConfig: deps.relayConfigStatus ? deps.relayConfigStatus() : null,
           devices: deps.devices.list(),
           pairings: deps.pairing.list(),
+          // ★ 配对终态（成功/失败/过期/中止）：list() 只含**进行中**会话，成功那一刻会话
+          //   就被删掉了 —— 面板仅凭 list() 无法区分「成功」与「失败」，只能永久停在
+          //   「等待手机提交…」（真机事故 2026-10-03）。旧实例无 last() → null，面板回退旧行为。
+          pairingLast: typeof deps.pairing.last === 'function' ? deps.pairing.last() : null,
           audit: deps.audit.tail(30)
         });
         return;
@@ -356,6 +360,8 @@ export function createAdminHandler(deps) {
         }
         sendJson(res, 200, {
           token,
+          // 与 /status 的 pairingLast.tokenMasked 同一格式：面板据此把终态认领到本次配对。
+          tokenMasked: `${token.slice(0, 6)}…${token.slice(-4)}`,
           pairingUrl,
           expiresAt,
           qrSvg,
@@ -687,31 +693,44 @@ async function refresh() {
     $('dev-rows').innerHTML = s.devices.length ? s.devices.map((d) => '<tr><td>' + esc(d.name) + '</td><td class="mono">' + esc(d.deviceId) + '</td><td>' + new Date(d.pairedAt).toLocaleString() + '</td><td>' + (d.lastActiveAt ? new Date(d.lastActiveAt).toLocaleString() : '-') + '</td><td><button class="danger" data-revoke="' + esc(d.deviceId) + '">撤销</button></td></tr>').join('') : '<tr><td colspan="5" class="note">暂无设备</td></tr>';
     // 待配对：倒计时 + 桌面侧校验码（手机提交公钥后出现，用于两端比对）
     const pendingList = s.pairings || [];
-    // ★ 配对完成检测（真机反馈 2026-10-02：手机扫码成功后面板滞留「等待手机提交…」，
-    //   用户不知道已经成功）。信号 = 上一轮还有「已出校验码」的待配对条目，这一轮
-    //   消失了，且设备表出现了新条目 —— 即配对完成。显示成功态并折叠二维码区。
+    // ★ 配对终态渲染（真机事故 2026-10-03 定稿版）：改由服务端给确定结局（s.pairingLast），
+    //   不再用「条目消失 + 设备表 2 分钟内有新条目」的启发式 —— 那个启发式有三个洞：
+    //   ① 它只在**已经出现过校验码**时才武装（先提交后失败的路径看不见）；
+    //   ② 失败/过期/验签不过的条目消失后一律不显示，面板就停在「等待手机提交…」；
+    //   ③ 别的连接器/别的面板刚配对成功的设备也会落进 2 分钟窗口，可能误报「✓ 配对成功」。
     const codedNow = pendingList.find((p) => p.code);
-    if (codedNow) {
-      window.__pairWatch = { tokenMasked: codedNow.tokenMasked, code: codedNow.code };
-    } else if (window.__pairWatch && !$('pair-out').classList.contains('hidden')) {
-      // 条目消失了：确认设备表里出现了对应的新配对（pairedAt 在本轮询周期附近）
-      const newest = (s.devices || []).slice().sort((a, b) => b.pairedAt - a.pairedAt)[0];
-      if (newest && Date.now() - newest.pairedAt < 120000) {
-        $('pair-code').innerHTML = '<span style="color:#4ade80;font-weight:600">✓ 配对成功</span> · 设「' + esc(newest.name) + '」已加入（2 分钟内有效票据，过期自动重连）';
-        $('pair-pending').textContent = '';
-        // 3 秒后自动折叠二维码区，避免占屏
-        setTimeout(() => { try { $('pair-out').classList.add('hidden'); } catch { /* 已被刷新 */ } }, 3000);
-        window.__pairWatch = null;
-      }
-    }
+    const last = s.pairingLast;
     if (pendingList.length > 0 && !$('pair-out').classList.contains('hidden')) {
       const left = Math.max(0, Math.round((pendingList[0].expiresAt - Date.now()) / 1000));
       $('pair-countdown').textContent = left > 0 ? left + 's 后过期' : '已过期，请重新生成';
-      const coded = pendingList.find((p) => p.code);
-      $('pair-code').textContent = coded ? ('桌面侧校验码 ' + coded.code) : '等待手机提交…';
+      $('pair-code').innerHTML = codedNow
+        ? ('桌面侧校验码 ' + esc(codedNow.code))
+        : '等待手机提交…';
       $('pair-pending').textContent = '';
     } else if (!$('pair-out').classList.contains('hidden')) {
-      $('pair-countdown').textContent = $('pair-countdown').textContent || '';
+      // 会话已终结：等终态落地（或它早已就位）。
+      // ★ 归属保护：只有终态带上了**本次面板**的 tokenMasked 才认领 —— 别人的面板 /
+      //   有人拿旧二维码在扫，都不能把结论写到这里。终态就位后清掉 watch（幂等）。
+      const mine = last && window.__pairWatch && Array.isArray(last.tokenMasks)
+        && last.tokenMasks.indexOf(window.__pairWatch.tokenMasked) !== -1;
+      if (mine) {
+        window.__pairWatch = null;
+        if (last.ok) {
+          $('pair-code').innerHTML = '<span style="color:#4ade80;font-weight:600">✓ 配对成功</span> · 设「' + esc(last.name || 'device') + '」已加入';
+          $('pair-pending').textContent = '';
+          setTimeout(() => { try { $('pair-out').classList.add('hidden'); } catch { /* 已被刷新 */ } }, 3000);
+        } else {
+          const text = {
+            expired: '二维码已过期（120 秒未完成），请重新生成。',
+            rejected: '挑战验签失败' + (last.detail ? '：' + esc(last.detail) : '') + '，请重新生成二维码再扫。',
+            reused: '该二维码已被使用过（一次性），请重新生成。',
+            'invalid-pubkey': '手机提交的公钥格式非法，请重新生成二维码再扫。',
+            aborted: '配对已被中止（紧急停用 kill switch），请先解除停用。'
+          }[last.reason] || '配对未完成，请重新生成二维码。';
+          $('pair-code').innerHTML = '<span style="color:#f85149;font-weight:600">✗ 未完成</span>';
+          $('pair-pending').textContent = text;
+        }
+      }
     }
     $('audit').textContent = (s.audit || []).map((e) => new Date(e.ts).toLocaleTimeString() + ' ' + JSON.stringify(e)).join('\\n') || '（暂无事件）';
   } catch (e) { $('relay-note').textContent = '状态加载失败：' + e.message; }
@@ -805,6 +824,10 @@ $('btn-pair').onclick = async () => {
   const d = await api('/kite/api/pairings', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name }) });
   $('pair-out').classList.remove('hidden');
   $('pair-code').textContent = '等待手机提交…';
+  $('pair-pending').textContent = '';
+  // ★ 认领本次配对的终态：只有 tokenMasked 对得上，成功/失败结论才落到这块面板
+  //   （别的面板或别人拿旧二维码扫出的结局不得污染这里）。
+  window.__pairWatch = d.tokenMasked ? { tokenMasked: d.tokenMasked } : null;
   $('pair-url').value = d.pairingUrl || '';
   if (d.pairingUrl) {
     try {

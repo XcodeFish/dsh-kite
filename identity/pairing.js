@@ -42,10 +42,56 @@ export function createPairingService({ keys, tickets, devices, ttlMs, logger, au
   /** pairingToken → { token, code?, expiresAt, pubKey?, name?, channel?, challenge?, used } */
   const pending = new Map();
 
+  /**
+   * 最近一次配对结局 —— 面板把「等待手机提交…」换成确定终态的唯一依据。
+   *
+   * ★ 为什么必须有（真机事故 2026-10-03）：`list()` 只反映**进行中**的会话，而配对成功的
+   *   那一刻 `complete()` 就把会话删掉了 —— 面板能观察到的只有「条目消失」，无法区分
+   *   「配对成功 / 挑战验签失败 / 二维码过期 / kill switch 清空」。桌面浮层因此永久停在
+   *   「等待手机提交…」，而下面的设备表已经出现新设备，用户无从判断到底连上没有。
+   *   单槽 + 时间单调守卫：状态有界（不随配对次数增长）；客户端用 tokenMasked 关联自己
+   *   发起的那一次，无关结局（例如别人拿旧二维码重扫）自动忽略。
+   */
+  let lastOutcome = null;
+
+  /** 与 list() 同一遮罩格式：客户端据此认领自己那次配对，且不泄漏令牌本体。 */
+  const mask = (token) => `${token.slice(0, 6)}…${token.slice(-4)}`;
+
+  /**
+   * 记录终态。`tokenMasked` = 单个会话的遮罩（面板认领用）；批量终局（一次性过期多条、
+   * kill switch 清空）用 `tokenMasks` 数组列出全部相关遮罩 —— 面板匹配任一即可，
+   * 否则「被批量清掉的那条会话」的所属面板仍会停在过程态。
+   */
+  function recordOutcome(outcome) {
+    const at = Date.now();
+    if (lastOutcome && lastOutcome.at > at) return; // 时间单调：乱序回调不得覆盖更新的结局
+    lastOutcome = { at, ...outcome };
+  }
+
+  /** 单个会话的终态（附 tokenMasked + tokenMasks 双标记，面板两者取或）。 */
+  function recordSession(session, outcome) {
+    const tokenMasked = mask(session.token);
+    recordOutcome({ ...outcome, tokenMasked, tokenMasks: [tokenMasked] });
+  }
+
   function sweep() {
     const now = Date.now();
+    const expired = [];
     for (const [token, session] of pending) {
-      if (session.expiresAt <= now) pending.delete(token);
+      if (session.expiresAt <= now) {
+        pending.delete(token);
+        expired.push({ name: session.name, tokenMasked: mask(token) });
+      }
+    }
+    // 过期是终局：面板据此把「等待手机提交…」翻成「已过期，请重新生成」。
+    if (expired.length > 0) {
+      recordOutcome({
+        ok: false,
+        reason: 'expired',
+        name: expired[expired.length - 1].name,
+        tokenMasked: expired[expired.length - 1].tokenMasked,
+        tokenMasks: expired.map((e) => e.tokenMasked)
+      });
     }
   }
 
@@ -72,6 +118,21 @@ export function createPairingService({ keys, tickets, devices, ttlMs, logger, au
       }));
     },
 
+    /**
+     * 最近一次配对的结局（终态）或 null：
+     *   {ok, reason?, deviceId?, name?, detail?, tokenMasked?, tokenMasks: [], at}
+     *
+     * ★ 与 list() 的分工：list() = 进行中（提交公钥后才有 code）；last() = 已终结。
+     *   面板必须两者合起来看 —— 只看 list() 时「配对成功」在列表里表现为「条目凭空消失」，
+     *   与「失败/过期」不可区分，这正是浮层滞留「等待手机提交…」的原因。
+     *   reason 取值：'done'（成功）/ 'expired' / 'rejected'（验签失败）/ 'reused'
+     *   / 'invalid-pubkey' / 'aborted'（kill switch 清空）。
+     *   认领方式：tokenMasks 含本次面板的 tokenMasked 才算自己的（单个终态即 [那个]）。
+     */
+    last() {
+      return lastOutcome ? { ...lastOutcome, tokenMasks: [...(lastOutcome.tokenMasks || [])] } : null;
+    },
+
     pendingCount() {
       sweep();
       return pending.size;
@@ -91,6 +152,10 @@ export function createPairingService({ keys, tickets, devices, ttlMs, logger, au
       const session = typeof token === 'string' ? pending.get(token) : undefined;
       if (!session || session.used) {
         audit?.({ kind: 'pair.reject', detail: { reason: session?.used ? 'token reused' : 'token unknown/expired' } });
+        // ★ 只有「已知会话被重复提交」才记结局；未知令牌（别人拿旧二维码来扫）不记 ——
+        //   否则会盖掉用户自己那次正在进行的配对。重复提交也不是终态：会话仍在
+        //   pending 里（挑战已发），手机签名成功后 complete() 会用更新的时间戳覆盖它。
+        if (session?.used) recordSession(session, { ok: false, reason: 'reused', name: session.name });
         throw new PairingError('pair/invalid-token', '配对令牌无效、过期或已被使用');
       }
       session.used = true; // 用后即焚：即使后续挑战失败也要重新生成 token（防穷举窗口）
@@ -98,9 +163,13 @@ export function createPairingService({ keys, tickets, devices, ttlMs, logger, au
       try {
         pubRaw = b64d(pubKey, 'pubKey');
       } catch {
+        recordSession(session, { ok: false, reason: 'invalid-pubkey', name: session.name });
         throw new PairingError('pair/invalid-pubkey', '设备公钥格式非法');
       }
-      if (pubRaw.length !== 32) throw new PairingError('pair/invalid-pubkey', '设备公钥必须是 32 字节 Ed25519');
+      if (pubRaw.length !== 32) {
+        recordSession(session, { ok: false, reason: 'invalid-pubkey', name: session.name });
+        throw new PairingError('pair/invalid-pubkey', '设备公钥必须是 32 字节 Ed25519');
+      }
       const deviceId = deviceIdFromPublicKey(pubRaw);
       const challenge = newChallenge();
       const code = verificationCode(pubKey, keys.ed25519.publicB64u);
@@ -128,6 +197,7 @@ export function createPairingService({ keys, tickets, devices, ttlMs, logger, au
       const verdict = tickets.verifyChallenge(b64d(session.pubKey, 'pubKey'), session.deviceId, challenge, sig, ts);
       if (!verdict.ok) {
         audit?.({ kind: 'pair.reject', deviceId: session.deviceId, detail: { reason: verdict.reason } });
+        recordSession(session, { ok: false, reason: 'rejected', detail: verdict.reason, name: session.deviceName ?? session.name });
         throw new PairingError('pair/verify-failed', `挑战验证失败：${verdict.reason}`);
       }
       // ★ P2：验签通过**之后**才写设备表 —— 未完成的配对不会留下幽灵设备条目。
@@ -142,6 +212,9 @@ export function createPairingService({ keys, tickets, devices, ttlMs, logger, au
       //   同时落到设备条目（devices.json）—— 连接器重连/中继重启后可重放恢复归属。
       const claim = { deviceId: session.deviceId, pubKey: device.pubKey, sig, ts, challenge };
       await devices.attachClaim(session.deviceId, claim);
+      // ★ 成功也是终局：面板据此把「等待手机提交…」翻成「✓ 配对成功」。
+      //   必须有这一条 —— 会话已从 pending 删除，list() 从此看不到任何痕迹。
+      recordSession(session, { ok: true, reason: 'done', deviceId: session.deviceId, name: device.name });
       return {
         deviceId: session.deviceId,
         ticket,
@@ -154,6 +227,11 @@ export function createPairingService({ keys, tickets, devices, ttlMs, logger, au
     /** 销毁全部未完成配对（kill switch）。 */
     abortAll() {
       const n = pending.size;
+      // 批量终局也要带全部遮罩：否则被清掉的会话所属面板仍停在「等待手机提交…」。
+      if (n > 0) {
+        const masks = [...pending.keys()].map(mask);
+        recordOutcome({ ok: false, reason: 'aborted', count: n, tokenMasks: masks });
+      }
       pending.clear();
       return n;
     }
